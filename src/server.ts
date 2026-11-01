@@ -267,7 +267,7 @@ export class AppServer {
   }
 
   start(): void {
-    this.server = this.app.listen(this.port, () => {
+    this.server = this.app.listen(Number(this.port), '127.0.0.1', () => {
       logger.log(`Server is running on port ${this.port}`);
       if (this.frontendPath && !this.disableWeb) {
         logger.log(`Open http://localhost:${this.port} in your browser to access MCPHub UI`);
