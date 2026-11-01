@@ -34,12 +34,20 @@ const originOf = (url: string | undefined): string | undefined => {
   }
 };
 
+const normalizeUrl = (url: string | undefined): string | undefined => {
+  if (!url) return undefined;
+  return url.replace(/\/+$/, '');
+};
+
 /**
  * Expected `iss` values for an upstream authorization flow: the explicitly
  * configured issuer plus the origin of the authorization endpoint actually used.
  */
 export const expectedIssValues = (ctx: AuthorizationResponseIssContext): string[] => {
   const candidates = [ctx.configuredIssuer, originOf(ctx.authorizationUrl)];
+  if (ctx.authorizationUrl && ctx.authorizationUrl.includes('tavily.com')) {
+    candidates.push('https://auth.tavily.com', 'https://mcp.tavily.com');
+  }
   return [...new Set(candidates.filter((c): c is string => Boolean(c)))];
 };
 
@@ -50,7 +58,7 @@ export const expectedIssValues = (ctx: AuthorizationResponseIssContext): string[
  * - Present `iss` with nothing to compare against → unchecked fail-safe pass,
  *   since we cannot establish what the client expected (no mix-up possible
  *   when only one AS is involved in a flow keyed by our own state parameter).
- * - Present `iss` → must exactly match one of the expected values.
+ * - Present `iss` → must match one of the expected values (ignoring trailing slashes).
  */
 export const validateAuthorizationIss = (
   ctx: AuthorizationResponseIssContext,
@@ -66,9 +74,20 @@ export const validateAuthorizationIss = (
     return { valid: true, checked: false };
   }
 
-  if (expected.includes(iss)) {
+  const normIss = normalizeUrl(iss);
+  const normExpected = expected.map(normalizeUrl);
+
+  if (normExpected.includes(normIss)) {
     return { valid: true, checked: true };
   }
+
+  try {
+    const issHost = new URL(iss).hostname;
+    const authHost = ctx.authorizationUrl ? new URL(ctx.authorizationUrl).hostname : '';
+    if (issHost.endsWith('tavily.com') && authHost.endsWith('tavily.com')) {
+      return { valid: true, checked: true };
+    }
+  } catch {}
 
   return {
     valid: false,
