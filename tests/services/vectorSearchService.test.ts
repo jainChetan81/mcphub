@@ -594,7 +594,7 @@ describe('vectorSearchService', () => {
       expect(mockVectorRepository.deleteStaleToolEmbeddings).not.toHaveBeenCalled();
     });
 
-    it('still writes a missing server row when every tool is current', async () => {
+    it('never writes the server row on a partial update, even when it is missing', async () => {
       mockVectorRepository.getToolIdentityByServerNameAndModel.mockResolvedValue([
         { contentId: 'redis:redis-get', textContent: 'redis-get Get a cache value key' },
       ]);
@@ -603,13 +603,13 @@ describe('vectorSearchService', () => {
       await saveToolsAsVectorEmbeddings('redis', [getTool] as any, { partial: true });
 
       expect(savedToolIds()).toEqual([]);
-      expect(mockVectorRepository.saveEmbedding).toHaveBeenCalledWith(
+      expect(mockVectorRepository.saveEmbedding).not.toHaveBeenCalledWith(
         'server',
-        'redis',
-        expect.any(String),
-        expect.any(Array),
-        expect.any(Object),
-        'text-embedding-3-small',
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
       );
     });
   });
@@ -915,6 +915,214 @@ describe('vectorSearchService', () => {
       }),
       'text-embedding-3-small',
     );
+  });
+
+  it('persists the other tools when one embedding fails and leaves the hash unset', async () => {
+    mockGetSmartRoutingConfig.mockResolvedValue({
+      enabled: true,
+      dbUrl: 'postgres://localhost/test',
+      embeddingProvider: 'openai',
+      embeddingModel: 'text-embedding-3-small',
+      llmProviderBaseUrl: 'https://api.openai.com/v1',
+      llmProviderApiKey: 'sk-test',
+      embeddingDimensions: undefined,
+    });
+    const tools = [
+      { name: 'redis-get', description: 'Get a cache value', inputSchema: {} } as any,
+      { name: 'redis-set', description: 'Set a cache value', inputSchema: {} } as any,
+    ];
+    mockEmbeddingCreate.mockImplementation(async ({ input }: { input: string }) => {
+      if (input.startsWith('redis-get')) {
+        throw Object.assign(new Error('bad request'), { status: 400 });
+      }
+      return { data: [{ embedding: [1, 2, 3] }] };
+    });
+    mockGetAppDataSource.mockReturnValue({
+      isInitialized: true,
+      query: jest.fn(async (sql: string) => {
+        if (sql.includes('format_type')) {
+          return [{ formatted_type: 'vector(3)', atttypmod: 3 }];
+        }
+        if (sql.includes('SELECT atttypmod as dimensions')) {
+          return [{ dimensions: 3 }];
+        }
+        if (sql.includes('GROUP BY dimensions, model')) {
+          return [{ dimensions: 3, model: 'text-embedding-3-small', count: 1 }];
+        }
+        return [];
+      }),
+    });
+    mockVectorRepository.countByServerNameAndModel.mockResolvedValue(0);
+    mockVectorRepository.saveEmbedding.mockResolvedValue({});
+    mockVectorRepository.deleteStaleToolEmbeddings.mockResolvedValue(0);
+
+    await saveToolsAsVectorEmbeddings('redis', tools);
+
+    const toolSaves = mockVectorRepository.saveEmbedding.mock.calls.filter(
+      ([type]) => type === 'tool',
+    );
+    expect(toolSaves.map(([, contentId]) => contentId)).toEqual(['redis:redis-set']);
+    expect(toolSaves[0][4].toolSetHash).toBe('');
+    expect(mockVectorRepository.deleteStaleToolEmbeddings).not.toHaveBeenCalled();
+  });
+
+  it('runs one more sync with the latest tools when a sync arrives mid-flight', async () => {
+    mockEmbeddingCreate.mockResolvedValue({ data: [{ embedding: [1, 2, 3] }] });
+    mockVectorRepository.countByServerNameAndModel.mockResolvedValue(0);
+    mockVectorRepository.saveEmbedding.mockResolvedValue({});
+    mockVectorRepository.deleteStaleToolEmbeddings.mockResolvedValue(0);
+    const toolA = { name: 'a-tool', description: 'first', inputSchema: {} } as any;
+    const toolB = { name: 'b-tool', description: 'second', inputSchema: {} } as any;
+
+    const first = saveToolsAsVectorEmbeddings('redis', [toolA]);
+    const second = saveToolsAsVectorEmbeddings('redis', [toolA]);
+    const third = saveToolsAsVectorEmbeddings('redis', [toolB]);
+    await Promise.all([first, second, third]);
+
+    const syncedContentIds = mockVectorRepository.saveEmbedding.mock.calls
+      .filter(([type]) => type === 'tool')
+      .map(([, contentId]) => contentId);
+    // First run persists a-tool; the coalesced rerun uses the latest list (b-tool).
+    expect(syncedContentIds).toEqual(['redis:a-tool', 'redis:b-tool']);
+  });
+
+  it('partial single-tool sync never runs stale cleanup or writes the server row', async () => {
+    mockEmbeddingCreate.mockResolvedValue({ data: [{ embedding: [1, 2, 3] }] });
+    mockVectorRepository.countByServerNameAndModel.mockResolvedValue(0);
+    mockVectorRepository.saveEmbedding.mockResolvedValue({});
+    mockVectorRepository.deleteStaleToolEmbeddings.mockResolvedValue(0);
+    const tool = { name: 'redis-get', description: 'Get', inputSchema: {} } as any;
+
+    mockVectorRepository.findByContentIdentity.mockResolvedValue({
+      metadata: { toolSetHash: 'stored-full-set-hash' },
+    });
+
+    await saveToolsAsVectorEmbeddings('redis', [tool], { partial: true });
+
+    expect(mockVectorRepository.deleteStaleToolEmbeddings).not.toHaveBeenCalled();
+    const kinds = mockVectorRepository.saveEmbedding.mock.calls.map(([type]) => type);
+    expect(kinds).toEqual(['tool']);
+    // The partial update keeps the hash the last full sync stored; it does not blank it.
+    expect(mockVectorRepository.saveEmbedding.mock.calls[0][4].toolSetHash).toBe(
+      'stored-full-set-hash',
+    );
+  });
+
+  it('partial update keeps an empty hash when the tool row has none', async () => {
+    mockEmbeddingCreate.mockResolvedValue({ data: [{ embedding: [1, 2, 3] }] });
+    mockVectorRepository.countByServerNameAndModel.mockResolvedValue(0);
+    mockVectorRepository.saveEmbedding.mockResolvedValue({});
+    mockVectorRepository.findByContentIdentity.mockResolvedValue(null);
+    const tool = { name: 'redis-get', description: 'Get', inputSchema: {} } as any;
+
+    await saveToolsAsVectorEmbeddings('redis', [tool], { partial: true });
+
+    expect(mockVectorRepository.saveEmbedding.mock.calls[0][4].toolSetHash).toBe('');
+  });
+
+  it('stops before the next write when removal lands during a tool save', async () => {
+    mockEmbeddingCreate.mockResolvedValue({ data: [{ embedding: [1, 2, 3] }] });
+    mockVectorRepository.countByServerNameAndModel.mockResolvedValue(0);
+    mockVectorRepository.deleteStaleToolEmbeddings.mockResolvedValue(0);
+    mockVectorRepository.deleteByServerName.mockResolvedValue(1);
+    const toolA = { name: 'a-tool', description: 'first', inputSchema: {} } as any;
+    const toolB = { name: 'b-tool', description: 'second', inputSchema: {} } as any;
+
+    // Removal lands inside the first tool save, after the pre-write check already passed.
+    let removal: Promise<void> | undefined;
+    mockVectorRepository.saveEmbedding.mockImplementation(async (type: string) => {
+      if (type === 'tool' && !removal) {
+        removal = removeServerToolEmbeddings('redis');
+      }
+      return {};
+    });
+
+    await Promise.all([saveToolsAsVectorEmbeddings('redis', [toolA, toolB]), removal]);
+
+    const toolWrites = mockVectorRepository.saveEmbedding.mock.calls.filter(
+      ([type]) => type === 'tool',
+    );
+    // The first save was already in progress; the second tool and the server row never write.
+    expect(toolWrites).toHaveLength(1);
+    expect(mockVectorRepository.saveEmbedding.mock.calls.map(([type]) => type)).not.toContain(
+      'server',
+    );
+    expect(mockVectorRepository.deleteStaleToolEmbeddings).not.toHaveBeenCalled();
+  });
+
+  it('stops before stale cleanup when removal lands during the last tool save', async () => {
+    mockEmbeddingCreate.mockResolvedValue({ data: [{ embedding: [1, 2, 3] }] });
+    mockVectorRepository.countByServerNameAndModel.mockResolvedValue(0);
+    mockVectorRepository.deleteStaleToolEmbeddings.mockResolvedValue(0);
+    mockVectorRepository.deleteByServerName.mockResolvedValue(1);
+    const tool = { name: 'a-tool', description: 'first', inputSchema: {} } as any;
+
+    let removal: Promise<void> | undefined;
+    mockVectorRepository.saveEmbedding.mockImplementation(async () => {
+      removal ??= removeServerToolEmbeddings('redis');
+      return {};
+    });
+
+    await Promise.all([saveToolsAsVectorEmbeddings('redis', [tool]), removal]);
+
+    expect(mockVectorRepository.deleteStaleToolEmbeddings).not.toHaveBeenCalled();
+    expect(mockVectorRepository.saveEmbedding.mock.calls.map(([type]) => type)).not.toContain(
+      'server',
+    );
+  });
+
+  it('partial sync does not replace a pending full-set sync', async () => {
+    mockEmbeddingCreate.mockResolvedValue({ data: [{ embedding: [1, 2, 3] }] });
+    mockVectorRepository.countByServerNameAndModel.mockResolvedValue(0);
+    mockVectorRepository.saveEmbedding.mockResolvedValue({});
+    mockVectorRepository.deleteStaleToolEmbeddings.mockResolvedValue(0);
+    const toolA = { name: 'a-tool', description: 'first', inputSchema: {} } as any;
+    const toolB = { name: 'b-tool', description: 'second', inputSchema: {} } as any;
+    const toolC = { name: 'c-tool', description: 'third', inputSchema: {} } as any;
+
+    const full1 = saveToolsAsVectorEmbeddings('redis', [toolA]);
+    const full2 = saveToolsAsVectorEmbeddings('redis', [toolA, toolB]);
+    const partial = saveToolsAsVectorEmbeddings('redis', [toolC], { partial: true });
+    await Promise.all([full1, full2, partial]);
+
+    const toolIds = mockVectorRepository.saveEmbedding.mock.calls
+      .filter(([type]) => type === 'tool')
+      .map(([, contentId]) => contentId);
+    // The partial update persists only its own tool and does not drop the pending full set.
+    expect(toolIds).toContain('redis:c-tool');
+    expect(toolIds).toContain('redis:a-tool');
+    expect(toolIds).toContain('redis:b-tool');
+  });
+
+  it('removal cancels an in-flight sync so it does not re-write the server rows', async () => {
+    mockGetSmartRoutingConfig.mockResolvedValue({
+      enabled: true,
+      dbUrl: 'postgres://localhost/test',
+      embeddingProvider: 'openai',
+      embeddingModel: 'text-embedding-3-small',
+      llmProviderBaseUrl: 'https://api.openai.com/v1',
+      llmProviderApiKey: 'sk-test',
+      embeddingDimensions: undefined,
+    });
+    mockEmbeddingCreate.mockResolvedValue({ data: [{ embedding: [1, 2, 3] }] });
+    mockVectorRepository.countByServerNameAndModel.mockResolvedValue(0);
+    mockVectorRepository.saveEmbedding.mockResolvedValue({});
+    mockVectorRepository.deleteStaleToolEmbeddings.mockResolvedValue(0);
+    mockVectorRepository.deleteByServerName.mockResolvedValue(1);
+    const tool = { name: 'redis-get', description: 'Get', inputSchema: {} } as any;
+
+    // Remove the server while the sync is between embedding generation and the DB writes.
+    // The removal is issued from inside the generation step, so the sync is guaranteed in flight.
+    let removal: Promise<void> | undefined;
+    mockEmbeddingCreate.mockImplementation(async () => {
+      removal ??= removeServerToolEmbeddings('redis');
+      return { data: [{ embedding: [1, 2, 3] }] };
+    });
+
+    await Promise.all([saveToolsAsVectorEmbeddings('redis', [tool]), removal]);
+
+    expect(mockVectorRepository.deleteByServerName).toHaveBeenCalledWith('redis');
+    expect(mockVectorRepository.saveEmbedding).not.toHaveBeenCalled();
   });
 
   it('removes server-level embeddings with tool embeddings', async () => {

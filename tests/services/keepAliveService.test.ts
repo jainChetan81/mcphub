@@ -379,6 +379,62 @@ describe('setupClientKeepAlive', () => {
     },
   );
 
+  it('stops a stale timer once the server entry is replaced', async () => {
+    jest.useFakeTimers();
+    const ping = jest.fn().mockResolvedValue({});
+    const serverInfo = makeServerInfo(
+      new StreamableHTTPClientTransport(new URL('https://example.com/mcp')),
+      ping,
+    );
+    let live: ServerInfo | undefined = serverInfo;
+
+    await setupClientKeepAlive(
+      serverInfo,
+      { type: 'streamable-http', url: 'https://example.com/mcp', enableKeepAlive: true },
+      { getServerInfo: () => live },
+    );
+
+    await jest.advanceTimersByTimeAsync(60000);
+    expect(ping).toHaveBeenCalledTimes(1);
+
+    live = makeServerInfo(
+      new StreamableHTTPClientTransport(new URL('https://example.com/mcp')),
+      jest.fn(),
+    );
+    await jest.advanceTimersByTimeAsync(60000);
+
+    expect(ping).toHaveBeenCalledTimes(1);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('keeps the timer running for a preserved shallow copy and pings the live entry', async () => {
+    jest.useFakeTimers();
+    const ping = jest.fn().mockResolvedValue({});
+    const serverInfo = makeServerInfo(
+      new StreamableHTTPClientTransport(new URL('https://example.com/mcp')),
+      ping,
+    );
+    let live: ServerInfo | undefined = serverInfo;
+
+    await setupClientKeepAlive(
+      serverInfo,
+      { type: 'streamable-http', url: 'https://example.com/mcp', enableKeepAlive: true },
+      { getServerInfo: () => live },
+    );
+
+    // initializeClientsFromSettings preserves a connected server as a shallow copy that
+    // keeps keepAliveIntervalId. The timer must keep owning that copy.
+    live = { ...serverInfo, status: 'disconnected' } as ServerInfo;
+    await jest.advanceTimersByTimeAsync(60000);
+    expect(ping).toHaveBeenCalledTimes(1);
+    expect(live.status).toBe('connected');
+    expect(serverInfo.status).toBe('connected');
+
+    await jest.advanceTimersByTimeAsync(60000);
+    expect(ping).toHaveBeenCalledTimes(2);
+    expect(jest.getTimerCount()).toBe(1);
+  });
+
   it('does not schedule checks for stdio servers', async () => {
     jest.useFakeTimers();
     const serverInfo = makeServerInfo(undefined, jest.fn());

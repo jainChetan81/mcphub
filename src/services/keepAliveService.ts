@@ -7,6 +7,8 @@ export interface KeepAliveOptions {
   enabled?: boolean;
   intervalMs?: number;
   reconnectServer?: (serverName: string) => Promise<void>;
+  /** Returns the live ServerInfo for a name. Timers whose captured object is no longer live stop. */
+  getServerInfo?: (serverName: string) => ServerInfo | undefined;
 }
 
 /**
@@ -80,25 +82,43 @@ export const setupClientKeepAlive = async (
   const interval = serverConfig.keepAliveInterval || 60000;
   let isChecking = false;
 
-  const isHealthCheckCurrent = (activeClient: NonNullable<ServerInfo['client']>): boolean =>
-    serverInfo.client === activeClient &&
-    serverInfo.enabled !== false &&
-    serverInfo.status !== 'connecting' &&
-    serverInfo.status !== 'oauth_required';
+  // The live entry for this server name. Without a lookup, the captured object is the entry.
+  const resolveLiveServerInfo = (): ServerInfo | undefined =>
+    options.getServerInfo ? options.getServerInfo(serverInfo.name) : serverInfo;
 
-  const shouldSkipCheck = (): boolean =>
-    serverInfo.enabled === false ||
-    serverInfo.status === 'connecting' ||
-    serverInfo.status === 'oauth_required';
+  // Ownership is decided by timer id, not object identity. A shallow copy of a connected
+  // server keeps the same keepAliveIntervalId, so its timer must keep running on that copy.
+  let timerId: NodeJS.Timeout | undefined;
+  const isOwnedByThisTimer = (candidate: ServerInfo | undefined): candidate is ServerInfo =>
+    candidate !== undefined && timerId !== undefined && candidate.keepAliveIntervalId === timerId;
+
+  const isHealthCheckCurrent = (
+    candidate: ServerInfo | undefined,
+    activeClient: NonNullable<ServerInfo['client']>,
+  ): candidate is ServerInfo =>
+    isOwnedByThisTimer(candidate) &&
+    candidate.client === activeClient &&
+    candidate.enabled !== false &&
+    candidate.status !== 'connecting' &&
+    candidate.status !== 'oauth_required';
+
+  const shouldSkipCheck = (target: ServerInfo): boolean =>
+    target.enabled === false || target.status === 'connecting' || target.status === 'oauth_required';
 
   const checkRemoteHealth = async (): Promise<void> => {
-    const activeClient = serverInfo.client;
-    if (shouldSkipCheck() || isChecking) {
+    const target = resolveLiveServerInfo();
+    if (!isOwnedByThisTimer(target)) {
+      // The live entry no longer holds this timer, so the timer is stale and stops.
+      if (timerId) clearInterval(timerId);
+      return;
+    }
+    const activeClient = target.client;
+    if (shouldSkipCheck(target) || isChecking) {
       return;
     }
 
-    if (serverInfo.status === 'disconnected' && options.reconnectServer) {
-      await setupClientKeepAlive(serverInfo, serverConfig, options);
+    if (target.status === 'disconnected' && options.reconnectServer) {
+      await setupClientKeepAlive(target, serverConfig, options);
       return;
     }
 
@@ -112,45 +132,48 @@ export const setupClientKeepAlive = async (
       // Modern HTTP has no ping or server-push channel. Discovery is supported
       // even by servers that expose no tools and discover() always performs a network request.
       if (activeClient.getProtocolEra?.() === 'modern') {
-        await activeClient.discover({ ...(serverInfo.options || {}), timeout: 5000 });
+        await activeClient.discover({ ...(target.options || {}), timeout: 5000 });
       } else if (typeof activeClient.ping === 'function') {
-        await activeClient.ping({ ...(serverInfo.options || {}), timeout: 5000 });
+        await activeClient.ping({ ...(target.options || {}), timeout: 5000 });
       } else {
-        await activeClient.listTools({}, { ...(serverInfo.options || {}), timeout: 5000 });
+        await activeClient.listTools({}, { ...(target.options || {}), timeout: 5000 });
       }
 
-      if (!isHealthCheckCurrent(activeClient)) {
+      const current = resolveLiveServerInfo();
+      if (!isHealthCheckCurrent(current, activeClient)) {
         return;
       }
 
-      if (serverInfo.status !== 'connected') {
+      if (current.status !== 'connected') {
         logger.log('Keep-alive ping restored server connection', {
-          serverName: serverInfo.name,
+          serverName: current.name,
         });
       }
-      serverInfo.status = 'connected';
-      serverInfo.error = null;
+      current.status = 'connected';
+      current.error = null;
     } catch (error) {
-      if (!isHealthCheckCurrent(activeClient)) {
+      const current = resolveLiveServerInfo();
+      if (!isHealthCheckCurrent(current, activeClient)) {
         return;
       }
 
       const message = formatErrorForLogging(error);
       const nextError = `Keep-alive failed: ${message}`;
-      if (serverInfo.status !== 'disconnected' || serverInfo.error !== nextError) {
-        logger.warn('Keep-alive ping failed', { serverName: serverInfo.name, error });
+      if (current.status !== 'disconnected' || current.error !== nextError) {
+        logger.warn('Keep-alive ping failed', { serverName: current.name, error });
       }
-      serverInfo.status = 'disconnected';
-      serverInfo.error = nextError;
+      current.status = 'disconnected';
+      current.error = nextError;
       await setupClientKeepAlive(serverInfo, serverConfig, options);
     } finally {
       isChecking = false;
     }
   };
 
-  serverInfo.keepAliveIntervalId = setInterval(async () => {
+  timerId = setInterval(async () => {
     await checkRemoteHealth();
   }, interval);
+  serverInfo.keepAliveIntervalId = timerId;
 
   logger.log('Keep-alive enabled for server', {
     serverName: serverInfo.name,

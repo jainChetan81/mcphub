@@ -2203,6 +2203,7 @@ const setupServerKeepAlive = (serverInfo: ServerInfo, serverConfig: ServerConfig
   }
   setupClientKeepAlive(serverInfo, serverConfig, {
     reconnectServer,
+    getServerInfo: (name) => getServerByName(name),
   }).catch((error) =>
     logger.warn('Keepalive setup failed', {
       serverName: serverInfo.name,

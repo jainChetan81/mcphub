@@ -1194,6 +1194,21 @@ const parseEmbeddingMetadata = (metadata: unknown): Record<string, any> | null =
 };
 
 /**
+ * Read the tool-set hash already stored for one tool row. A partial update changes
+ * only that row's text, so it keeps the hash the last full sync stored instead of
+ * blanking it (a blank hash forces a full re-embed of the server on reconnect).
+ */
+const keepStoredToolSetHash = async (
+  repository: VectorEmbeddingRepository,
+  serverName: string,
+  toolName: string,
+): Promise<string> => {
+  const existing = await repository.findByContentIdentity('tool', `${serverName}:${toolName}`);
+  const stored = (existing?.metadata as { toolSetHash?: unknown } | undefined)?.toolSetHash;
+  return typeof stored === 'string' ? stored : '';
+};
+
+/**
  * Save tool information as vector embeddings
  *
  * Uses a two-phase approach to prevent DB connection staleness:
@@ -1271,6 +1286,31 @@ const embeddingConfigIdentity = (config: SmartRoutingConfig): string =>
     config.azureOpenaiEmbeddingModel,
   ]);
 
+// Per-server sync coalescing. A full-set sync that arrives while one is in flight only
+// records its tools and marks the server dirty. The in-flight sync then runs once
+// more with the latest tools, so bursts of reconnects do not queue full batches.
+//
+// Removal drops the server's entry: an in-flight loop checks that its entry is still the
+// registered one (isCurrent) before each persist step, so a removed server cannot have
+// its rows re-written by a sync that was already running.
+interface EmbeddingSyncState {
+  dirty: boolean;
+  tools: Tool[];
+  options: { reportProgress?: boolean };
+  cancelled: boolean;
+}
+
+const embeddingSyncInFlight = new Map<string, EmbeddingSyncState>();
+
+const cancelInFlightEmbeddingSync = (serverName: string): void => {
+  const state = embeddingSyncInFlight.get(serverName);
+  if (state) {
+    state.cancelled = true;
+    state.dirty = false;
+    embeddingSyncInFlight.delete(serverName);
+  }
+};
+
 export const saveToolsAsVectorEmbeddings = async (
   serverName: string,
   tools: Tool[],
@@ -1280,7 +1320,61 @@ export const saveToolsAsVectorEmbeddings = async (
     partial?: boolean;
   } = {},
 ): Promise<void> => {
+  // A single-tool update is independent of the full set. It never joins the coalescing
+  // state, so it cannot replace a pending full set or be mistaken for one.
+  if (options.partial === true) {
+    await saveToolsAsVectorEmbeddingsOnce(serverName, tools, options);
+    return;
+  }
+
+  const inFlight = embeddingSyncInFlight.get(serverName);
+  if (inFlight) {
+    inFlight.dirty = true;
+    inFlight.tools = tools;
+    inFlight.options = { reportProgress: options.reportProgress };
+    return;
+  }
+
+  const state: EmbeddingSyncState = {
+    dirty: false,
+    tools,
+    options: { reportProgress: options.reportProgress },
+    cancelled: false,
+  };
+  embeddingSyncInFlight.set(serverName, state);
+  try {
+    do {
+      state.dirty = false;
+      try {
+        await saveToolsAsVectorEmbeddingsOnce(serverName, state.tools, {
+          ...state.options,
+          isCurrent: () => !state.cancelled && embeddingSyncInFlight.get(serverName) === state,
+        });
+      } catch (error) {
+        // A newer sync is pending, so run it instead of failing this one.
+        if (!state.dirty || state.cancelled) {
+          throw error;
+        }
+      }
+    } while (state.dirty && !state.cancelled);
+  } finally {
+    if (embeddingSyncInFlight.get(serverName) === state) {
+      embeddingSyncInFlight.delete(serverName);
+    }
+  }
+};
+
+const saveToolsAsVectorEmbeddingsOnce = async (
+  serverName: string,
+  tools: Tool[],
+  options: {
+    reportProgress?: boolean;
+    partial?: boolean;
+    isCurrent?: () => boolean;
+  } = {},
+): Promise<void> => {
   tools = filterModelVisibleTools(tools);
+  const partial = options.partial === true;
   const shouldReport = options.reportProgress === true;
   let progressErrorEmitted = false;
   let lastProgressCurrent = 0;
@@ -1334,6 +1428,7 @@ export const saveToolsAsVectorEmbeddings = async (
         : config.embeddingModel;
     const serverConfig = await getServerDao().findById(serverName);
     if (!serverConfig || serverConfig.enabled === false || batch.invalidated) return;
+    if (options.isCurrent && !options.isCurrent()) return;
     const serverDescription = serverConfig.description || '';
     const serverSearchableText = buildServerSearchableText(serverName, serverDescription);
 
@@ -1454,6 +1549,7 @@ export const saveToolsAsVectorEmbeddings = async (
       searchableText: string;
       embedding: number[];
     }> = [];
+    let failedToolCount = 0;
 
     let vectorDimensionsReset = false;
 
@@ -1473,6 +1569,9 @@ export const saveToolsAsVectorEmbeddings = async (
         toolEmbeddings.push({ tool, searchableText, embedding });
         emitProgress(_toolIdx + 1, 'in_progress');
       } catch (error: any) {
+        // One failed tool must not discard the rest of the batch. The failed tool is
+        // left unembedded, and the stored hash stays empty so the next sync retries it.
+        failedToolCount++;
         const status = extractErrorStatus(error);
         logger.warn('[EMBED_SYNC_ERROR] Failed while embedding tool', {
           serverName,
@@ -1480,18 +1579,19 @@ export const saveToolsAsVectorEmbeddings = async (
           status: status ?? 'unknown',
           error: summarizeErrorForLogging(error),
         });
-        emitProgress(_toolIdx, 'error');
-        throw error;
       }
     }
 
-    let serverEmbedding: number[];
+    // A partial update leaves the server-level row untouched, so it embeds no server text.
+    let serverEmbedding: number[] = [];
     try {
-      serverEmbedding = await generateEmbedding(
-        serverSearchableText,
-        'document',
-        smartRoutingConfig,
-      );
+      if (!partial) {
+        serverEmbedding = await generateEmbedding(
+          serverSearchableText,
+          'document',
+          smartRoutingConfig,
+        );
+      }
     } catch (error: any) {
       const status = extractErrorStatus(error);
       logger.warn('[EMBED_SYNC_ERROR] Failed while embedding server metadata', {
@@ -1523,7 +1623,12 @@ export const saveToolsAsVectorEmbeddings = async (
       }
 
       const currentServer = await getServerDao().findById(serverName);
-      if (batch.invalidated || !currentServer || currentServer.enabled === false) {
+      if (
+        batch.invalidated ||
+        !currentServer ||
+        currentServer.enabled === false ||
+        (options.isCurrent && !options.isCurrent())
+      ) {
         logger.log('[Embedding] Discarding stale server batch', { serverName });
         emitProgress(toolEmbeddings.length, 'error');
         return false;
@@ -1540,6 +1645,15 @@ export const saveToolsAsVectorEmbeddings = async (
 
       // Check DB vector dimensions exactly once for the whole batch (all embeddings
       // produced by the same model always share the same dimension count).
+      const skipped = (): boolean => {
+        if (options.isCurrent && !options.isCurrent()) {
+          logger.log(`[Embedding] [${serverName}] Server removed during sync; skipping persistence`);
+          return true;
+        }
+        return false;
+      };
+
+      if (skipped()) return false;
       if (toolEmbeddings.length > 0 || serverEmbedding.length > 0) {
         vectorDimensionsReset = await checkDatabaseVectorDimensions(
           toolEmbeddings[0]?.embedding.length ?? serverEmbedding.length,
@@ -1547,6 +1661,8 @@ export const saveToolsAsVectorEmbeddings = async (
       }
 
       for (const { tool, searchableText, embedding } of toolEmbeddings) {
+        // Removal can land during any await above; re-check before each write.
+        if (skipped()) return false;
         await vectorRepository.saveEmbedding(
           'tool',
           `${serverName}:${tool.name}`,
@@ -1557,7 +1673,13 @@ export const saveToolsAsVectorEmbeddings = async (
             toolName: tool.name,
             description: tool.description,
             inputSchema: tool.inputSchema,
-            toolSetHash: expectedToolSetHash,
+            // A partial update keeps the stored hash; a full sync stores the expected
+            // hash only when every tool embedded, otherwise an empty hash forces a retry.
+            toolSetHash: partial
+              ? await keepStoredToolSetHash(vectorRepository, serverName, tool.name)
+              : failedToolCount === 0
+                ? expectedToolSetHash
+                : '',
           },
           persistedEmbeddingModel,
         );
@@ -1566,7 +1688,10 @@ export const saveToolsAsVectorEmbeddings = async (
       // Remove stale tool embeddings left over from previously-removed tools.
       // Without this, count(existing) > count(expected) and the skip check on the
       // next restart would always fail, forcing a full re-generation every time.
-      if (!options.partial && toolEmbeddings.length > 0) {
+      // A partial update holds only one tool, and a failed tool must keep its row, so
+      // neither may prune the others.
+      if (!partial && toolEmbeddings.length > 0 && failedToolCount === 0) {
+        if (skipped()) return false;
         const currentContentIds = toolEmbeddings.map(({ tool }) => `${serverName}:${tool.name}`);
         const staleCount = await vectorRepository.deleteStaleToolEmbeddings(
           serverName,
@@ -1578,17 +1703,21 @@ export const saveToolsAsVectorEmbeddings = async (
         }
       }
 
-      await vectorRepository.saveEmbedding(
-        'server',
-        serverName,
-        serverSearchableText,
-        serverEmbedding,
-        {
+      // A partial update leaves the server-level row untouched; a full sync repairs it.
+      if (!partial) {
+        if (skipped()) return false;
+        await vectorRepository.saveEmbedding(
+          'server',
           serverName,
-          description: serverDescription,
-        },
-        persistedEmbeddingModel,
-      );
+          serverSearchableText,
+          serverEmbedding,
+          {
+            serverName,
+            description: serverDescription,
+          },
+          persistedEmbeddingModel,
+        );
+      }
 
       return true;
     });
@@ -1871,6 +2000,7 @@ export const getAllVectorizedTools = async (
  */
 export const removeServerToolEmbeddings = async (serverName: string): Promise<void> => {
   invalidateEmbeddingBatches(serverName);
+  cancelInFlightEmbeddingSync(serverName);
   await withEmbeddingMutation(async () => {
     try {
       const smartRoutingConfig = await getSmartRoutingConfig();
