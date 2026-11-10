@@ -127,6 +127,27 @@ describe('MCP Service - header env var expansion from server config', () => {
     });
   });
 
+  it('expands non-admin-owned remote headers using only config env vars', async () => {
+    process.env.AUTH_TOKEN = 'hub-secret-must-not-leak';
+    await createTransportFromConfig('demo-member-streamable', {
+      owner: 'member',
+      type: 'streamable-http',
+      url: 'https://8.8.8.8/mcp',
+      env: {
+        AUTH_TOKEN: 'configured-token',
+      },
+      headers: {
+        Authorization: 'Bearer ${AUTH_TOKEN}',
+      },
+    });
+
+    const options = (StreamableHTTPClientTransport as jest.Mock).mock.calls[0][1];
+
+    expect(options.requestInit.headers).toEqual({
+      Authorization: 'Bearer configured-token',
+    });
+  });
+
   it('expands sse header values using config env vars', async () => {
     await createTransportFromConfig('demo-sse', {
       type: 'sse',
