@@ -493,6 +493,169 @@ describe('mcpService group server alias', () => {
     );
   });
 
+  it('does not let a resource template broaden a group resource allowlist', async () => {
+    const serverConfig = teamGroup.servers[0] as any;
+    const serverInfo = aliasedServerInfo();
+    const readResource = serverInfo.client?.readResource as jest.Mock;
+    setServerInfosForTest([serverInfo]);
+    try {
+      serverConfig.resources = ['test://{id}'];
+      const allowed = await handleReadResourceRequest(
+        { params: { uri: 'test://private' } },
+        { sessionId: 'team-session' },
+      );
+      expect(allowed.contents[0].text).toBe('guide');
+      expect(readResource).toHaveBeenCalledWith({ uri: 'test://private' });
+
+      readResource.mockClear();
+      serverConfig.resources = ['test://guide'];
+      const result = await handleReadResourceRequest(
+        { params: { uri: 'test://private' } },
+        { sessionId: 'team-session' },
+      );
+
+      expect(result.contents[0].text).toContain('Resource not found: test://private');
+      expect(readResource).not.toHaveBeenCalled();
+    } finally {
+      serverConfig.resources = 'all';
+    }
+  });
+
+  describe('UI resource ownership', () => {
+    const uri = 'ui://widgets/42';
+    const template = 'ui://widgets/{id}';
+    const read = () =>
+      RequestContextService.getInstance().runWithCustomRequestContext(
+        {
+          headers: {},
+          stateless: true,
+          group: 'team-a',
+          clientCapabilities: MCP_APPS_CAPABILITIES,
+        },
+        () => handleReadResourceRequest({ params: { uri } }, { group: 'team-a' }),
+      );
+    const setup = (advertise = true) => {
+      const owner = aliasedServerInfo();
+      owner.resources = [];
+      owner.resourceTemplates = advertise ? [{ name: 'Widget', uriTemplate: template }] : [];
+      const legacy = {
+        ...aliasedServerInfo(),
+        name: 'legacy',
+        resources: [],
+        resourceTemplates: [],
+      };
+      (teamGroup.servers as any[]).push({ name: 'legacy', resources: 'all', tools: 'all' });
+      setServerInfosForTest([legacy, owner]);
+      return { owner, legacy };
+    };
+
+    afterEach(() => {
+      (teamGroup.servers[0] as any).resources = 'all';
+      teamGroup.servers.splice(1);
+    });
+
+    it('authorizes concrete expansions through a template-only group allowlist', async () => {
+      const { owner } = setup();
+      teamGroup.servers.splice(1);
+      setServerInfosForTest([owner]);
+      (teamGroup.servers[0] as any).resources = [template];
+      expect((await read()).contents[0].text).toBe('guide');
+      expect(owner.client!.readResource).toHaveBeenCalledWith({ uri }, { cacheMode: 'bypass' });
+    });
+
+    it('selects the advertised template owner before an earlier legacy responder', async () => {
+      const { owner, legacy } = setup();
+      expect((await read()).contents[0].text).toBe('guide');
+      expect(owner.client!.readResource).toHaveBeenCalledTimes(1);
+      expect(legacy.client!.readResource).not.toHaveBeenCalled();
+    });
+
+    it.each(['template', 'concrete', 'group', 'exact'])(
+      'does not fall through to legacy responders when the %s owner is denied',
+      async (denied) => {
+        const { owner, legacy } = setup(denied !== 'exact');
+        if (denied === 'group') (teamGroup.servers[0] as any).resources = ['ui://other'];
+        else {
+          if (denied === 'exact') owner.resources = [{ name: 'Widget', uri }];
+          mockServerDao.findById.mockImplementation(async (name: string) => ({
+            name,
+            enabled: true,
+            tools: {},
+            prompts: {},
+            resources:
+              name === owner.name
+                ? { [denied === 'template' ? template : uri]: { enabled: false } }
+                : {},
+          }));
+        }
+        expect((await read()).contents[0].text).toContain('Resource not found:');
+        expect(owner.client!.readResource).not.toHaveBeenCalled();
+        expect(legacy.client!.readResource).not.toHaveBeenCalled();
+      },
+    );
+
+    it('keeps exact ownership ahead of a competing template', async () => {
+      const { owner, legacy } = setup();
+      owner.resources = [{ name: 'Widget', uri }];
+      legacy.resourceTemplates = [{ name: 'Widget', uriTemplate: template }];
+      expect((await read()).contents[0].text).toBe('guide');
+      expect(owner.client!.readResource).toHaveBeenCalledTimes(1);
+      expect(legacy.client!.readResource).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['ui', 'disabled'],
+      ['ui', 'group'],
+      ['paperless', 'disabled'],
+      ['paperless', 'group'],
+    ])('blocks competing templates when the %s exact owner is denied by %s', async (scheme, denial) => {
+      const concreteUri = `${scheme}://widgets/42`;
+      const { owner, legacy } = setup(false);
+      owner.resources = [{ name: 'Widget', uri: concreteUri }];
+      legacy.resourceTemplates = [{ name: 'Widget', uriTemplate: `${scheme}://widgets/{id}` }];
+      if (denial === 'group') {
+        (teamGroup.servers[0] as any).resources = [`${scheme}://other`];
+      } else {
+        mockServerDao.findById.mockImplementation(async (name: string) => ({
+          name,
+          enabled: true,
+          tools: {},
+          prompts: {},
+          resources: name === owner.name ? { [concreteUri]: { enabled: false } } : {},
+        }));
+      }
+      const result = await RequestContextService.getInstance().runWithCustomRequestContext(
+        {
+          headers: {},
+          stateless: true,
+          group: 'team-a',
+          clientCapabilities: MCP_APPS_CAPABILITIES,
+        },
+        () => handleReadResourceRequest({ params: { uri: concreteUri } }, { group: 'team-a' }),
+      );
+      expect(result.contents[0].text).toContain('Resource not found:');
+      expect(owner.client!.readResource).not.toHaveBeenCalled();
+      expect(legacy.client!.readResource).not.toHaveBeenCalled();
+    });
+
+    it('preserves legacy UI probing when no exact or template owner advertises the URI', async () => {
+      const { owner, legacy } = setup(false);
+      expect((await read()).contents[0].text).toBe('guide');
+      expect(legacy.client!.readResource).toHaveBeenCalledTimes(1);
+      expect(owner.client!.readResource).not.toHaveBeenCalled();
+    });
+
+    it('propagates discovery failures instead of probing an unknown UI owner', async () => {
+      const { owner, legacy } = setup();
+      owner.resourceTemplates = undefined;
+      (owner.client!.listResourceTemplates as jest.Mock).mockRejectedValue(
+        new Error('discovery failed'),
+      );
+      expect((await read()).contents[0].text).toContain('discovery failed');
+      expect(legacy.client!.readResource).not.toHaveBeenCalled();
+    });
+  });
+
   it('isolates concurrent sessionless tool lists by request group', async () => {
     const context = RequestContextService.getInstance();
     const lists = await Promise.all(

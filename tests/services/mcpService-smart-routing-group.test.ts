@@ -117,6 +117,9 @@ jest.mock('../../src/config/index.js', () => ({
 import * as mcpService from '../../src/services/mcpService.js';
 import { getGroup } from '../../src/services/sseService.js';
 import { handleSearchToolsRequest } from '../../src/services/smartRoutingService.js';
+import { InMemoryTransport, Server } from '@modelcontextprotocol/server';
+import { LegacyMcpClient } from '../../src/clients/legacyMcpClient.js';
+import { ResilientJsonSchemaValidator } from '../../src/utils/jsonSchemaValidator.js';
 
 describe('MCP Service - Smart Routing with Group Support', () => {
   beforeEach(() => {
@@ -450,6 +453,325 @@ describe('MCP Service - Smart Routing with Group Support', () => {
       expect(result.isError).not.toBe(true);
       expect(result.contents[0].text).toBe('guide');
       expect(readResource).toHaveBeenCalledWith({ uri: 'resource://docs/guide' });
+    });
+
+    it('follows resource template cursors before matching a concrete URI', async () => {
+      const readResource = jest.fn().mockResolvedValue({
+        contents: [{ uri: 'x://items/42', text: 'page two' }],
+      });
+      const listResourceTemplates = jest
+        .fn()
+        .mockResolvedValueOnce({
+          resourceTemplates: [{ uriTemplate: 'x://other/{id}', name: 'Other' }],
+          nextCursor: 'next-page',
+        })
+        .mockResolvedValueOnce({
+          resourceTemplates: [{ uriTemplate: 'x://items/{id}', name: 'Item' }],
+        });
+      mcpService.setServerInfosForTest([
+        {
+          name: 'paged',
+          status: 'connected',
+          enabled: true,
+          tools: [],
+          prompts: [],
+          resources: [],
+          client: { listResourceTemplates, readResource },
+          options: {},
+        } as any,
+      ]);
+
+      const result = await mcpService.handleReadResourceRequest(
+        { params: { uri: 'x://items/42' } },
+        { sessionId: 'session-smart' },
+      );
+
+      expect(result.contents[0].text).toBe('page two');
+      expect(listResourceTemplates).toHaveBeenNthCalledWith(1, {}, {});
+      expect(listResourceTemplates).toHaveBeenNthCalledWith(2, { cursor: 'next-page' }, {});
+      expect(readResource).toHaveBeenCalledWith({ uri: 'x://items/42' });
+    });
+
+    it('treats an unsupported template-list method as no advertised templates', async () => {
+      const unsupported = Object.assign(new Error('method not found'), { code: -32601 });
+      const listResourceTemplates = jest.fn().mockRejectedValue(unsupported);
+      mcpService.setServerInfosForTest([
+        {
+          name: 'no-template-method',
+          status: 'connected',
+          enabled: true,
+          resources: [],
+          client: { listResourceTemplates },
+          options: {},
+        } as any,
+      ]);
+      const result = await mcpService.handleReadResourceRequest(
+        { params: { uri: 'x://items/42' } },
+        { sessionId: 'session-smart' },
+      );
+      expect(result.contents[0].text).toContain('Resource not found: x://items/42');
+    });
+
+    it('continues template discovery on later servers after an upstream error', async () => {
+      const expectedError = new Error('first server unavailable');
+      const readResource = jest.fn().mockResolvedValue({
+        contents: [{ uri: 'x://items/42', text: 'second server' }],
+      });
+      mcpService.setServerInfosForTest([
+        {
+          name: 'failed-first',
+          status: 'connected',
+          enabled: true,
+          resources: [],
+          client: { listResourceTemplates: jest.fn().mockRejectedValue(expectedError) },
+          options: {},
+        },
+        {
+          name: 'matching-second',
+          status: 'connected',
+          enabled: true,
+          resources: [],
+          client: {
+            listResourceTemplates: jest.fn().mockResolvedValue({
+              resourceTemplates: [{ uriTemplate: 'x://items/{id}' }],
+            }),
+            readResource,
+          },
+          options: {},
+        },
+      ] as any);
+      const result = await mcpService.handleReadResourceRequest(
+        { params: { uri: 'x://items/42' } },
+        { sessionId: 'session-smart' },
+      );
+      expect(result.contents[0].text).toBe('second server');
+      expect(readResource).toHaveBeenCalled();
+    });
+
+    it('stops a paginated template listing when an upstream repeats its cursor', async () => {
+      const listResourceTemplates = jest.fn().mockResolvedValue({
+        resourceTemplates: [],
+        nextCursor: 'same-cursor',
+      });
+      mcpService.setServerInfosForTest([
+        {
+          name: 'repeating-pages',
+          status: 'connected',
+          enabled: true,
+          resources: [],
+          client: { listResourceTemplates },
+          options: {},
+        } as any,
+      ]);
+      const result = await mcpService.handleReadResourceRequest(
+        { params: { uri: 'x://items/42' } },
+        { sessionId: 'session-smart' },
+      );
+      expect(result.contents[0].text).toContain('repeated cursor');
+      expect(listResourceTemplates).toHaveBeenCalledTimes(2);
+    });
+
+    it('caches a successful template miss across repeated resource reads', async () => {
+      const listResourceTemplates = jest.fn().mockResolvedValue({
+        resourceTemplates: [{ uriTemplate: 'x://other/{id}' }],
+      });
+      const serverInfo = {
+        name: 'cached-miss',
+        status: 'connected',
+        enabled: true,
+        resources: [],
+        client: { listResourceTemplates },
+        options: {},
+      } as any;
+      mcpService.setServerInfosForTest([serverInfo]);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const result = await mcpService.handleReadResourceRequest(
+          { params: { uri: 'x://items/42' } },
+          { sessionId: 'session-smart' },
+        );
+        expect(result.contents[0].text).toContain('Resource not found: x://items/42');
+      }
+      expect(listResourceTemplates).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not wake a cached on-demand server whose templates do not match', async () => {
+      const listResourceTemplates = jest.fn();
+      const readResource = jest.fn();
+      mcpService.setServerInfosForTest([
+        {
+          name: 'idle-unrelated',
+          status: 'disconnected',
+          enabled: true,
+          config: { startOnDemand: true },
+          resources: [],
+          resourceTemplates: [{ uriTemplate: 'x://other/{id}' }],
+          client: undefined,
+          options: {},
+        } as any,
+      ]);
+      const result = await mcpService.handleReadResourceRequest(
+        { params: { uri: 'x://items/42' } },
+        { sessionId: 'session-smart' },
+      );
+      expect(result.contents[0].text).toContain('Resource not found: x://items/42');
+      expect(listResourceTemplates).not.toHaveBeenCalled();
+      expect(readResource).not.toHaveBeenCalled();
+    });
+
+    it('continues after template discovery fails and reports the failure if no server resolves', async () => {
+      const discoveryError = new Error('upstream template listing unavailable');
+      const listResourceTemplates = jest.fn().mockRejectedValue(discoveryError);
+      mcpService.setServerInfosForTest([
+        {
+          name: 'unavailable',
+          status: 'connected',
+          enabled: true,
+          resources: [],
+          client: { listResourceTemplates },
+          options: {},
+        } as any,
+      ]);
+      const result = await mcpService.handleReadResourceRequest(
+        { params: { uri: 'x://items/42' } },
+        { sessionId: 'session-smart' },
+      );
+      expect(result.contents[0].text).toContain('upstream template listing unavailable');
+    });
+
+    it('refreshes cached templates when a modern resource list expires', async () => {
+      const listResourceTemplates = jest.fn().mockResolvedValue({
+        resourceTemplates: [{ uriTemplate: 'x://items/{id}' }],
+      });
+      mcpService.setServerInfosForTest([
+        {
+          name: 'modern',
+          status: 'connected',
+          enabled: true,
+          resources: [],
+          resourceTemplates: [],
+          client: {
+            getProtocolEra: () => 'modern',
+            getServerCapabilities: () => ({ resources: {} }),
+            listResources: jest.fn().mockResolvedValue({ resources: [] }),
+            listResourceTemplates,
+            readResource: jest
+              .fn()
+              .mockResolvedValue({ contents: [{ uri: 'x://items/42', text: 'fresh owner' }] }),
+          },
+        },
+      ] as any);
+      const result = await mcpService.handleReadResourceRequest(
+        { method: 'resources/read', params: { uri: 'x://items/42' } },
+        { sessionId: 'session-smart' },
+      );
+      expect(result.contents[0].text).toBe('fresh owner');
+      expect(listResourceTemplates).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([false, true])(
+      'retains modern resource refresh errors while trying later servers: %s',
+      async (laterMatch) => {
+        const listResourceTemplates = jest.fn();
+        const failed = {
+          name: 'modern-failed',
+          status: 'connected',
+          enabled: true,
+          resources: [],
+          client: {
+            getProtocolEra: () => 'modern',
+            getServerCapabilities: () => ({ resources: {} }),
+            listResources: jest.fn().mockRejectedValue(new Error('modern resources unavailable')),
+            listResourceTemplates,
+          },
+        };
+        const healthy = {
+          name: 'healthy',
+          status: 'connected',
+          enabled: true,
+          resources: [],
+          client: {
+            listResourceTemplates: jest
+              .fn()
+              .mockResolvedValue({
+                resourceTemplates: laterMatch ? [{ uriTemplate: 'x://items/{id}' }] : [],
+              }),
+            readResource: jest
+              .fn()
+              .mockResolvedValue({ contents: [{ uri: 'x://items/42', text: 'healthy owner' }] }),
+          },
+        };
+        mcpService.setServerInfosForTest([failed, healthy] as any);
+        const result = await mcpService.handleReadResourceRequest(
+          { method: 'resources/read', params: { uri: 'x://items/42' } },
+          { sessionId: 'session-smart' },
+        );
+        expect(result.contents[0].text).toContain(
+          laterMatch ? 'healthy owner' : 'modern resources unavailable',
+        );
+        expect(listResourceTemplates).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      ['paperless://documents/{id}/{resource}', 'paperless://documents/42/download'],
+      ['paperless://documents{/category,id}', 'paperless://documents/books/42'],
+      ['paperless://documents/{category,id}', 'paperless://documents/books,42'],
+    ])('reads a concrete URI advertised by %s', async (uriTemplate, uri) => {
+      const upstream = new Server(
+        { name: 'template-upstream', version: '1' },
+        { capabilities: { resources: {} } },
+      );
+      upstream.setRequestHandler('resources/templates/list', async () => ({
+        resourceTemplates: [{ name: 'Document', uriTemplate }],
+      }));
+      upstream.setRequestHandler('resources/read', async ({ params }) => ({
+        contents: [{ uri: params.uri, mimeType: 'text/plain', text: `read:${params.uri}` }],
+      }));
+
+      const client = new LegacyMcpClient(
+        { name: 'mcphub-test', version: '1' },
+        { jsonSchemaValidator: new ResilientJsonSchemaValidator() },
+      );
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await upstream.connect(serverTransport);
+      await client.connect(clientTransport);
+      const competingRead = jest
+        .fn()
+        .mockResolvedValue({ contents: [{ uri, text: 'wrong owner' }] });
+      mcpService.setServerInfosForTest([
+        {
+          name: 'server1',
+          status: 'connected',
+          enabled: true,
+          tools: [],
+          prompts: [],
+          resources: [],
+          client,
+          options: {},
+        } as any,
+        {
+          name: 'server2',
+          status: 'connected',
+          enabled: true,
+          resources: [],
+          resourceTemplates: [{ name: 'Catch-all', uriTemplate: 'paperless://{+path}' }],
+          client: { readResource: competingRead },
+        } as any,
+      ]);
+
+      try {
+        const result = await mcpService.handleReadResourceRequest(
+          { params: { uri } },
+          { sessionId: 'session-smart' },
+        );
+
+        expect(result.isError).not.toBe(true);
+        expect(result.contents).toEqual([{ uri, mimeType: 'text/plain', text: `read:${uri}` }]);
+        expect(competingRead).not.toHaveBeenCalled();
+      } finally {
+        await client.close();
+        await upstream.close();
+      }
     });
   });
 

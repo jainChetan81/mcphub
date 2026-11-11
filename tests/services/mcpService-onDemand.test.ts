@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { getSettingsPath } from '../../src/config/index.js';
+import { Client } from '@modelcontextprotocol/client';
 /// <reference types="jest" />
 
 // Regression tests for issue #1029: startOnDemand servers could never be woken.
@@ -25,6 +26,8 @@ const mockClient = {
   listTools: mockListTools,
   listPrompts: jest.fn().mockResolvedValue({ prompts: [] }),
   listResources: jest.fn().mockResolvedValue({ resources: [] }),
+  listResourceTemplates: jest.fn().mockResolvedValue({ resourceTemplates: [] }),
+  readResource: jest.fn(),
   callTool: mockCallTool,
 };
 
@@ -125,6 +128,7 @@ jest.mock('../../src/dao/index.js', () => ({
   })),
   getBuiltinResourceDao: jest.fn(() => ({
     findEnabled: jest.fn(async () => []),
+    findByUri: jest.fn(async () => undefined),
   })),
   getUserDao: jest.fn(() => ({
     findByUsername: jest.fn(async () => undefined),
@@ -185,6 +189,8 @@ describe('startOnDemand lifecycle', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockClient.listResourceTemplates.mockReset().mockResolvedValue({ resourceTemplates: [] });
+    mockClient.readResource.mockReset();
     mockConnect.mockResolvedValue(undefined);
     mockListTools.mockResolvedValue({
       tools: [{ name: 'ping', description: 'ping', inputSchema: { type: 'object' } }],
@@ -203,6 +209,167 @@ describe('startOnDemand lifecycle', () => {
     createTransportSpy.mockRestore();
     if (previousReplicaMode === undefined) delete process.env.MCPHUB_REPLICA_MODE;
     else process.env.MCPHUB_REPLICA_MODE = previousReplicaMode;
+  });
+
+  describe('resource template lifecycle', () => {
+    const uri = 'x://items/42';
+    const templates = [{ name: 'Item', uriTemplate: 'x://items/{id}' }];
+    const read = () =>
+      mcpService.handleReadResourceRequest(
+        { method: 'resources/read', params: { uri } },
+        { sessionId: 'resource-session' },
+      );
+    const list = () =>
+      mcpService.handleListResourceTemplatesRequest({}, { sessionId: 'resource-session' });
+    const wake = async () => {
+      const info = createSleepingServerInfo();
+      mcpService.setServerInfosForTest([info as any]);
+      await mcpService.handleCallToolRequest(
+        { params: { name: 'demo::ping', arguments: {} } },
+        { sessionId: 'resource-session' },
+      );
+      const options = (Client as jest.Mock).mock.calls.at(-1)![1];
+      return { info, changed: options.listChanged.resources.onChanged };
+    };
+
+    beforeEach(() => {
+      jest.useFakeTimers();
+      mockFindById.mockResolvedValue({ ...ON_DEMAND_CONFIG, idleTimeoutMs: 1000 });
+      mockClient.readResource.mockResolvedValue({ contents: [{ uri, text: 'owner' }] });
+    });
+    afterEach(() => {
+      jest.clearAllTimers();
+      jest.useRealTimers();
+    });
+
+    it.each(['exact', 'template'])(
+      'wakes the advertised %s owner after actual idle shutdown',
+      async (kind) => {
+        const { info } = await wake();
+        if (kind === 'exact') info.resources = [{ uri, name: 'Exact' }];
+        mockClient.listResourceTemplates.mockResolvedValue({ resourceTemplates: templates });
+        await list();
+        expect(info.resourceTemplates).toEqual(templates);
+        await jest.advanceTimersByTimeAsync(1000);
+        expect(info.status).toBe('disconnected');
+        expect(info.client).toBeUndefined();
+        expect(mockClient.close).toHaveBeenCalledTimes(1);
+        const earlierRead = jest
+          .fn()
+          .mockResolvedValue({ contents: [{ uri, text: 'wrong owner' }] });
+        if (kind === 'exact')
+          mcpService.setServerInfosForTest([
+            createSleepingServerInfo({
+              name: 'earlier',
+              status: 'connected',
+              config: {},
+              client: {
+                listResourceTemplates: jest
+                  .fn()
+                  .mockResolvedValue({ resourceTemplates: templates }),
+                readResource: earlierRead,
+              },
+            }),
+            info,
+          ] as any);
+        const pending = deferred<{ contents: Array<{ uri: string; text: string }> }>();
+        const started = deferred<void>();
+        mockClient.readResource.mockImplementationOnce(() => {
+          started.resolve();
+          return pending.promise;
+        });
+        const reading = read();
+        // Avoid waiting for a read that a broken resolver sent to the wrong owner.
+        const outcome = await Promise.race([
+          started.promise.then(() => 'started'),
+          reading.then(() => 'finished'),
+        ]);
+        expect(outcome).toBe('started');
+        await jest.advanceTimersByTimeAsync(2000);
+        expect(info.client).toBe(mockClient);
+        expect(mockClient.close).toHaveBeenCalledTimes(1);
+        pending.resolve({ contents: [{ uri, text: 'owner' }] });
+        expect((await reading).contents[0].text).toBe('owner');
+        expect(mockConnect).toHaveBeenCalledTimes(2);
+        expect(earlierRead).not.toHaveBeenCalled();
+        await jest.advanceTimersByTimeAsync(1000);
+        expect(info.client).toBeUndefined();
+      },
+    );
+
+    it.each([false, true])(
+      'invalidates cached templates even when resource refresh fails: %s',
+      async (failed) => {
+        const { info, changed } = await wake();
+        await list();
+        expect(info.resourceTemplates).toEqual([]);
+        mockClient.listResourceTemplates.mockResolvedValue({ resourceTemplates: templates });
+        changed(failed ? new Error('resource refresh failed') : null, failed ? undefined : []);
+        expect((await read()).contents[0].text).toBe('owner');
+        expect(info.resourceTemplates).toEqual(templates);
+      },
+    );
+
+    it.each([
+      ['read', 'success'],
+      ['list', 'success'],
+      ['read', 'failure'],
+      ['list', 'failure'],
+    ])(
+      'does not restore stale templates or backoff from an in-flight %s %s',
+      async (operation, outcome) => {
+        const { info, changed } = await wake();
+        const started = deferred<void>();
+        const stale = deferred<{ resourceTemplates: typeof templates }>();
+        mockClient.listResourceTemplates.mockImplementationOnce(() => {
+          started.resolve();
+          return stale.promise;
+        });
+        const old = operation === 'read' ? read() : list();
+        const settled = old.catch((error: Error) => error);
+        await started.promise;
+        changed(new Error('resource refresh failed'));
+        const current = [{ name: 'New', uriTemplate: 'x://new/{id}' }];
+        mockClient.listResourceTemplates.mockResolvedValue({ resourceTemplates: current });
+        await list();
+        if (outcome === 'success') stale.resolve({ resourceTemplates: templates });
+        else stale.reject(new Error('obsolete failure'));
+        await settled;
+        expect(info.resourceTemplates).toEqual(current);
+        expect(mockClient.readResource).not.toHaveBeenCalled();
+        expect((await read()).contents[0].text).toContain('Resource not found');
+      },
+    );
+
+    it('coalesces concurrent cold template discovery', async () => {
+      const { info } = await wake();
+      const started = deferred<void>();
+      const completion = deferred<{ resourceTemplates: typeof templates }>();
+      mockClient.listResourceTemplates.mockImplementationOnce(() => {
+        started.resolve();
+        return completion.promise;
+      });
+      const first = read();
+      await started.promise;
+      const second = read();
+      // Flush routing awaits without resolving the pending upstream discovery.
+      await jest.advanceTimersByTimeAsync(0);
+      expect(mockClient.listResourceTemplates).toHaveBeenCalledTimes(1);
+      completion.resolve({ resourceTemplates: templates });
+      expect((await Promise.all([first, second])).map((result) => result.contents[0].text)).toEqual(
+        ['owner', 'owner'],
+      );
+      expect(info.resourceTemplates).toEqual(templates);
+    });
+
+    it('clears discovery error backoff after a resource-list change', async () => {
+      const { changed } = await wake();
+      mockClient.listResourceTemplates.mockRejectedValueOnce(new Error('old failure'));
+      expect((await read()).contents[0].text).toContain('old failure');
+      mockClient.listResourceTemplates.mockResolvedValue({ resourceTemplates: templates });
+      changed(null, []);
+      expect((await read()).contents[0].text).toBe('owner');
+    });
   });
 
   it('wakes a sleeping on-demand server on a regular tools/call and arms idle shutdown', async () => {

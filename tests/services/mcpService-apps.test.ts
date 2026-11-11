@@ -11,7 +11,7 @@ const createMockClient = () => ({
   listTools: jest.fn(),
   listPrompts: jest.fn(),
   listResources: jest.fn(),
-  listResourceTemplates: jest.fn(),
+  listResourceTemplates: jest.fn().mockResolvedValue({ resourceTemplates: [] }),
   readResource: jest.fn(),
   callTool: jest.fn(),
 });
