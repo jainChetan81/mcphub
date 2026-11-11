@@ -88,7 +88,6 @@ export const setupClientKeepAlive = async (
 
   // Ownership is decided by timer id, not object identity. A shallow copy of a connected
   // server keeps the same keepAliveIntervalId, so its timer must keep running on that copy.
-  let timerId: NodeJS.Timeout | undefined;
   const isOwnedByThisTimer = (candidate: ServerInfo | undefined): candidate is ServerInfo =>
     candidate !== undefined && timerId !== undefined && candidate.keepAliveIntervalId === timerId;
 
@@ -170,7 +169,7 @@ export const setupClientKeepAlive = async (
     }
   };
 
-  timerId = setInterval(async () => {
+  const timerId = setInterval(async () => {
     await checkRemoteHealth();
   }, interval);
   serverInfo.keepAliveIntervalId = timerId;

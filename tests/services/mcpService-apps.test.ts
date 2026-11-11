@@ -1,17 +1,20 @@
 import { UserContextService } from '../../src/services/userContextService.js';
 import { recordListFreshness, invalidateListFreshness } from '../../src/utils/listFreshness.js';
+import { recordUpstreamList } from '../../src/services/upstreamListRefresh.js';
 import { Client } from '@modelcontextprotocol/client';
 
 const createMockClient = () => ({
   connect: jest.fn().mockResolvedValue(undefined),
   close: jest.fn(),
+  getProtocolEra: jest.fn(() => 'legacy'),
+  getNegotiatedProtocolVersion: jest.fn(() => '2025-11-25'),
   getServerCapabilities: jest.fn(() => ({ tools: {}, resources: {}, prompts: {} })),
   getServerVersion: jest.fn(() => ({ name: 'apps-upstream', version: '1.0.0' })),
   getInstructions: jest.fn(),
   listTools: jest.fn(),
   listPrompts: jest.fn(),
   listResources: jest.fn(),
-  listResourceTemplates: jest.fn(),
+  listResourceTemplates: jest.fn().mockResolvedValue({ resourceTemplates: [] }),
   readResource: jest.fn(),
   callTool: jest.fn(),
 });
@@ -240,6 +243,7 @@ const markSessionAsAppsCapable = async (sessionId: string, group: string) => {
 describe('mcpService MCP Apps transparent proxy', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockClient.getProtocolEra.mockReturnValue('legacy');
     cleanupAllServers();
     mockClientsByServer.clear();
     mockFindAll.mockResolvedValue([makeServerConfig('apps-server')]);
@@ -407,6 +411,127 @@ describe('mcpService MCP Apps transparent proxy', () => {
     expect((await list()).ttlMs).toBe(0);
     mockClient.listResourceTemplates.mockRejectedValueOnce(new Error('upstream failed'));
     expect((await list()).ttlMs).toBe(0);
+  });
+
+  it.each([
+    { templates: [] },
+    { templates: [{ name: 'Old', uriTemplate: 'old://items/{id}' }] },
+  ])(
+    'refreshes expired templates independently of a fresh resource list (%j)',
+    async ({ templates: initialTemplates }) => {
+      const uri = 'new://items/42';
+      mockClient.getProtocolEra.mockReturnValue('modern');
+      mockClient.listResourceTemplates.mockResolvedValue({ resourceTemplates: initialTemplates });
+      await initUpstreamServers();
+      await flushPromises();
+      const server = getServerByName('apps-server')!;
+      expect(server.client?.getProtocolEra?.()).toBe('modern');
+      await handleListResourceTemplatesRequest({}, { sessionId: 'ordinary-session' });
+
+      const added = [{ name: 'New', uriTemplate: 'new://items/{id}' }];
+      mockClient.listResourceTemplates.mockResolvedValue({ resourceTemplates: added });
+      recordUpstreamList(server.client!, 'templates', 1, performance.now() - 10);
+      recordUpstreamList(server.client!, 'resources', 60000, performance.now());
+      mockClient.readResource.mockResolvedValue({ contents: [{ uri, text: 'new owner' }] });
+      mockClient.listResourceTemplates.mockClear();
+      mockClient.listResources.mockClear();
+
+      const result = await handleReadResourceRequest(
+        { method: 'resources/read', params: { uri } },
+        { sessionId: 'ordinary-session' },
+      );
+
+      expect(result.contents[0].text).toBe('new owner');
+      expect(server.resourceTemplates).toEqual(added);
+      expect(mockClient.listResourceTemplates).toHaveBeenCalledTimes(1);
+      expect(mockClient.listResources).not.toHaveBeenCalled();
+    },
+  );
+
+  it('isolates optional modern template failures from exact reads and later template owners', async () => {
+    const exactUri = 'items://exact';
+    const templateUri = 'items://42';
+    mockClient.getProtocolEra.mockReturnValue('modern');
+    mockClient.listResources.mockResolvedValue({ resources: [{ uri: exactUri, name: 'Exact' }] });
+    mockClient.listResourceTemplates.mockRejectedValue(new Error('template discovery failed'));
+    mockClient.readResource.mockResolvedValue({ contents: [{ uri: exactUri, text: 'exact owner' }] });
+    await initUpstreamServers();
+    await flushPromises();
+    const server = getServerByName('apps-server')!;
+    recordUpstreamList(server.client!, 'resources', 60000, performance.now());
+    mockClient.listResources.mockClear();
+    mockClient.listResourceTemplates.mockClear();
+    const read = (uri: string) =>
+      handleReadResourceRequest({ method: 'resources/read', params: { uri } }, {});
+
+    expect((await read(exactUri)).contents[0].text).toBe('exact owner');
+    expect(mockClient.listResourceTemplates).not.toHaveBeenCalled();
+    expect((await read(templateUri)).contents[0].text).toContain('template discovery failed');
+    expect(mockClient.readResource).toHaveBeenCalledTimes(1);
+    expect((await read(exactUri)).contents[0].text).toBe('exact owner');
+    expect(mockClient.listResources).not.toHaveBeenCalled();
+
+    const other = createMockClient();
+    other.getProtocolEra.mockReturnValue('modern');
+    other.listTools.mockResolvedValue({ tools: [] });
+    other.listPrompts.mockResolvedValue({ prompts: [] });
+    other.listResources.mockResolvedValue({ resources: [] });
+    other.listResourceTemplates.mockResolvedValue({
+      resourceTemplates: [{ name: 'Item', uriTemplate: 'items://{id}' }],
+    });
+    other.readResource.mockResolvedValue({ contents: [{ uri: templateUri, text: 'later owner' }] });
+    mockClientsByServer.set('other-server', other);
+    mockFindAll.mockResolvedValue([
+      makeServerConfig('apps-server'),
+      makeServerConfig('other-server'),
+    ]);
+    await initUpstreamServers();
+    await flushPromises();
+    expect((await read(templateUri)).contents[0].text).toBe('later owner');
+    expect(other.readResource).toHaveBeenCalledTimes(1);
+  });
+
+  it('discovers template fallback on each disposable modern request client', async () => {
+    mockClient.getProtocolEra.mockReturnValue('modern');
+    const config = { ...makeServerConfig('apps-server'), passthroughHeaders: ['X-Tenant'] };
+    mockFindAll.mockResolvedValue([config]);
+    mockFindById.mockResolvedValue(config);
+    await initUpstreamServers();
+    await flushPromises();
+    const server = getServerByName('apps-server')!;
+    server.resourceTemplates = [{ name: 'Global', uriTemplate: 'items://{id}' }];
+    recordUpstreamList(server.client!, 'templates', 60000, performance.now());
+    mockClient.listResourceTemplates.mockClear();
+
+    for (const tenant of ['alice', 'bob']) {
+      const scoped = createMockClient();
+      scoped.getProtocolEra.mockReturnValue('modern');
+      scoped.close.mockResolvedValue(undefined);
+      scoped.listResources.mockResolvedValue({ resources: [] });
+      scoped.listResourceTemplates.mockResolvedValue({
+        resourceTemplates: [{ name: tenant, uriTemplate: `items://${tenant}/{id}` }],
+      });
+      const uri = `items://${tenant}/42`;
+      scoped.readResource.mockResolvedValue({ contents: [{ uri, text: tenant }] });
+      mockClientsByServer.set('apps-server', scoped);
+      const read = (requestedUri: string) =>
+        RequestContextService.getInstance().runWithCustomRequestContext(
+          { headers: { 'x-tenant': tenant }, stateless: true, group: 'apps-server' },
+          () =>
+            handleReadResourceRequest(
+              { method: 'resources/read', params: { uri: requestedUri } },
+              { group: 'apps-server' },
+            ),
+        );
+      expect((await read(uri)).contents[0].text).toBe(tenant);
+      expect((await read('items://global')).contents[0].text).toContain('Resource not found');
+      expect(scoped.listResourceTemplates).toHaveBeenCalledTimes(2);
+      expect(scoped.readResource).toHaveBeenCalledTimes(1);
+      expect(scoped.close).toHaveBeenCalledTimes(2);
+    }
+    expect(server.resourceTemplates).toEqual([{ name: 'Global', uriTemplate: 'items://{id}' }]);
+    expect(mockClient.listResourceTemplates).not.toHaveBeenCalled();
+    expect(mockClient.readResource).not.toHaveBeenCalled();
   });
 
   it('does not certify a projection if the bearer key is revoked during the build', async () => {

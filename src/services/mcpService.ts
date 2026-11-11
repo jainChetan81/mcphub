@@ -17,6 +17,7 @@ import {
   preserveListFreshness,
   combineListFreshness,
   remainingListTtl,
+  invalidateListFreshness,
 } from '../utils/listFreshness.js';
 import { expandServerConfig, getServerEnvironment } from './serverConfigEnvironment.js';
 import { getMcpRequestGroup } from '../utils/mcpRequestGroup.js';
@@ -33,6 +34,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import { canAccessGroupRoute } from '../utils/groupAccess.js';
 import { canServeToolRequests } from '../utils/serverAvailability.js';
+import { uriMatchesResourceTemplate } from '../utils/resourceTemplateMatch.js';
 import {
   assertToolCallArgumentsSafe,
   isToolCallGuardEnabled,
@@ -96,6 +98,7 @@ import {
   ProxychainsConfig,
   IGroup,
   IGroupServerConfig,
+  UpstreamResourceTemplate,
   IUser,
 } from '../types/index.js';
 import { expandEnvVars, replaceEnvVars, getNameSeparator } from '../config/index.js';
@@ -1201,7 +1204,7 @@ const updateServerResourcesCache = (serverInfo: ServerInfo, resources: McpResour
 // by the current request; TTL and in-flight work are scoped to the live client.
 const refreshModernServerLists = async (
   info: ServerInfo,
-  fields: Array<Exclude<UpstreamList, 'templates'>>,
+  fields: UpstreamList[],
 ): Promise<void> => {
   const client = info.client;
   if (
@@ -1216,7 +1219,7 @@ const refreshModernServerLists = async (
     info.client === client && info.enabled !== false && info.status === 'connected';
   await Promise.all(
     fields.map(async (field) => {
-      if (!capabilities?.[field]) return;
+      if (!(field === 'templates' ? capabilities?.resources : capabilities?.[field])) return;
       await revalidateUpstreamList(client, field, async () => {
         if (field === 'tools') {
           const { tools } = await client.listTools({}, info.options || {});
@@ -1250,7 +1253,7 @@ const refreshModernServerLists = async (
             )
               broadcastPromptListChanged();
           }
-        } else {
+        } else if (field === 'resources') {
           const { resources } = await client.listResources({}, info.options || {});
           if (current()) {
             const previous = JSON.stringify(info.resources);
@@ -1262,6 +1265,8 @@ const refreshModernServerLists = async (
             )
               broadcastResourceListChanged();
           }
+        } else {
+          await discoverResourceTemplates(info, true);
         }
       });
     }),
@@ -1326,6 +1331,7 @@ const createUpstreamMcpClient = (
           debounceMs: 0,
           onChanged: (error, resources) => {
             const serverInfo = getServerInfo();
+            if (serverInfo) invalidateResourceTemplates(serverInfo);
             if (error) {
               logListChangedRefreshError('resource');
               return;
@@ -2122,6 +2128,7 @@ const callToolWithReconnect = async (
             }
 
             serverInfo.client = newClient;
+            invalidateResourceTemplates(serverInfo);
             serverInfo.transport = newTransport;
             serverInfo.status = 'connected';
             setupServerKeepAlive(serverInfo, server);
@@ -3557,6 +3564,9 @@ const ensureServerReady = async (serverInfo: ServerInfo): Promise<void> => {
   }
 
   const spawnStart = Date.now();
+  const hadResourceTemplates =
+    serverInfo.resourceTemplates !== undefined ||
+    templateDiscoveryStates.get(serverInfo)?.wakeHints !== undefined;
 
   const spawnPromise = (async () => {
     // Load the config fresh from the DAO for the expanded transport config and
@@ -3596,6 +3606,7 @@ const ensureServerReady = async (serverInfo: ServerInfo): Promise<void> => {
     // Mutate in place so every holder of this serverInfo (resolution paths,
     // the caller about to invoke the tool) sees the live client/status.
     serverInfo.client = client;
+    invalidateResourceTemplates(serverInfo, true);
     serverInfo.transport = transport;
     serverInfo.options = requestOptions;
     serverInfo.version = client.getServerVersion?.()?.version;
@@ -3644,6 +3655,18 @@ const ensureServerReady = async (serverInfo: ServerInfo): Promise<void> => {
         updateServerResourcesCache(serverInfo, resources.resources);
       } catch (error) {
         logger.warn(`[${name}] Failed to list resources during wake`, {
+          error: summarizeErrorForLogging(error),
+        });
+      }
+    }
+
+    // Reconfirm previous discovery on the new client. A recent failure keeps
+    // its retry delay, but must not block tools or exact-resource reads.
+    if (hadResourceTemplates && capabilities?.resources) {
+      try {
+        await discoverResourceTemplates(serverInfo);
+      } catch (error) {
+        logger.warn(`[${name}] Failed to refresh resource templates during wake`, {
           error: summarizeErrorForLogging(error),
         });
       }
@@ -5328,6 +5351,36 @@ const handleListResourcesRequestImpl = async (_: any, extra: any) => {
   };
 };
 
+const MAX_RESOURCE_TEMPLATE_PAGES = 100;
+const MAX_RESOURCE_TEMPLATES = 10_000;
+
+const listAllResourceTemplates = async (
+  client: Client,
+  options?: RequestOptions,
+): Promise<UpstreamResourceTemplate[]> => {
+  const templates: UpstreamResourceTemplate[] = [];
+  const snapshots: object[] = [];
+  const cursors = new Set<string>();
+  let cursor: string | undefined;
+  for (let page = 0; page < MAX_RESOURCE_TEMPLATE_PAGES; page++) {
+    const listed = await client.listResourceTemplates(cursor ? { cursor } : {}, options || {});
+    templates.push(...(listed.resourceTemplates || []));
+    snapshots.push(listed.resourceTemplates);
+    if (templates.length > MAX_RESOURCE_TEMPLATES) {
+      throw new Error('Resource template listing exceeded the supported limit');
+    }
+    cursor = listed.nextCursor;
+    if (!cursor) {
+      combineListFreshness(snapshots, templates);
+      return templates;
+    }
+    if (cursors.has(cursor))
+      throw new Error('Resource template listing returned a repeated cursor');
+    cursors.add(cursor);
+  }
+  throw new Error('Resource template listing exceeded the supported page limit');
+};
+
 const handleListResourceTemplatesRequestImpl = async (_: any, extra: any) => {
   const sessionId = extra.sessionId || '';
   const group = getMcpRequestGroup(extra);
@@ -5349,12 +5402,12 @@ const handleListResourceTemplatesRequestImpl = async (_: any, extra: any) => {
         return [];
       }
 
-      const templates = await serverInfo.client.listResourceTemplates({}, serverInfo.options || {});
-      snapshots.push(templates.resourceTemplates);
+      const templates = await discoverResourceTemplates(serverInfo, true);
+      snapshots.push(templates);
       const filteredTemplates = await filterResourceTemplatesByGroup(
         lookupGroup,
         serverInfo.name,
-        templates.resourceTemplates || [],
+        templates,
         serverConfigsByName.get(serverInfo.name),
       );
       return appsRouteContext.enabled
@@ -5375,7 +5428,193 @@ const handleListResourceTemplatesRequestImpl = async (_: any, extra: any) => {
   return { resourceTemplates };
 };
 
-const handleReadResourceRequestImpl = async (request: any, extra: any) => {
+type TemplateDiscoveryState = {
+  client?: Client;
+  // Last successful discovery permits a wake, never a resource read.
+  wakeHints?: UpstreamResourceTemplate[];
+  pending?: Promise<UpstreamResourceTemplate[]>;
+  failure?: { at: number; error: unknown };
+};
+const templateDiscoveryStates = new WeakMap<ServerInfo, TemplateDiscoveryState>();
+const resourceDiscoveryErrors = new WeakMap<ServerInfo, unknown>();
+const TEMPLATE_DISCOVERY_RETRY_MS = 60_000;
+
+const invalidateResourceTemplates = (
+  serverInfo: ServerInfo,
+  preserveFailure = false,
+): TemplateDiscoveryState => {
+  const previous = templateDiscoveryStates.get(serverInfo);
+  const state: TemplateDiscoveryState = {
+    client: serverInfo.client,
+    wakeHints: serverInfo.resourceTemplates ?? previous?.wakeHints,
+    failure: preserveFailure ? previous?.failure : undefined,
+  };
+  if (serverInfo.resourceTemplates) invalidateListFreshness(serverInfo.resourceTemplates);
+  serverInfo.resourceTemplates = undefined;
+  // Replace the generation so obsolete discovery cannot publish hints or errors.
+  templateDiscoveryStates.set(serverInfo, state);
+  return state;
+};
+
+const discoverResourceTemplates = async (
+  serverInfo: ServerInfo,
+  refresh = false,
+): Promise<UpstreamResourceTemplate[]> => {
+  if (!refresh && serverInfo.resourceTemplates !== undefined) return serverInfo.resourceTemplates;
+  const client = serverInfo.client;
+  if (!client?.listResourceTemplates || serverInfo.status !== 'connected') return [];
+  const previous = templateDiscoveryStates.get(serverInfo);
+  if (previous?.client === client) {
+    if (previous.pending) return previous.pending;
+    const failure = previous.failure;
+    if (!refresh && failure && Date.now() - failure.at < TEMPLATE_DISCOVERY_RETRY_MS)
+      throw failure.error;
+  }
+  const state = invalidateResourceTemplates(serverInfo);
+  const current = () =>
+    serverInfo.client === client && templateDiscoveryStates.get(serverInfo) === state;
+  const pending = (async () => {
+    try {
+      const templates = await listAllResourceTemplates(client, serverInfo.options);
+      if (!current())
+        throw new Error('Resource templates changed during discovery; retry the request');
+      serverInfo.resourceTemplates = templates;
+      state.wakeHints = templates;
+      return templates;
+    } catch (error) {
+      if (current()) {
+        if (
+          typeof error === 'object' &&
+          error !== null &&
+          'code' in error &&
+          error.code === -32601
+        ) {
+          // Servers may expose resources without implementing resources/templates/list.
+          serverInfo.resourceTemplates = [];
+          state.wakeHints = [];
+          return [];
+        }
+        state.failure = { at: Date.now(), error };
+      }
+      throw error;
+    } finally {
+      state.pending = undefined;
+    }
+  })();
+  state.pending = pending;
+  return pending;
+};
+
+const isCurrentResourceReadAllowed = async (
+  serverInfo: ServerInfo,
+  uri: string,
+  group: string | undefined,
+  matchingTemplates: string[] = [],
+): Promise<boolean> => {
+  const serverConfig = await getServerDao().findById(serverInfo.name);
+  // Resolve current group policy within the principal/request scope. Modern
+  // discovery may use a disposable projection, not the global runtime entry.
+  const { filteredServerInfos, serverConfigsByName } = await getFilteredServerInfosForGroup(group);
+  if (
+    !filteredServerInfos.includes(serverInfo) ||
+    serverConfig?.enabled === false ||
+    serverConfig?.resources?.[uri]?.enabled === false
+  ) {
+    return false;
+  }
+  const groupResources = serverConfigsByName.get(serverInfo.name)?.resources;
+  const selected = (template: string) =>
+    !Array.isArray(groupResources) ||
+    groupResources.includes(uri) ||
+    groupResources.includes(template);
+  return matchingTemplates.length > 0
+    ? matchingTemplates.some(
+        (template) => selected(template) && serverConfig?.resources?.[template]?.enabled !== false,
+      )
+    : selected(uri);
+};
+
+const findResourceTemplateServer = async (
+  uri: string,
+  serverInfos: ServerInfo[],
+  group: string | undefined,
+): Promise<{ serverInfo?: ServerInfo; release?: () => void; error?: unknown; advertised?: boolean }> => {
+  let lastDiscoveryError: unknown;
+  let advertised = false;
+  for (const serverInfo of serverInfos) {
+    if (resourceDiscoveryErrors.has(serverInfo)) {
+      lastDiscoveryError = resourceDiscoveryErrors.get(serverInfo);
+      continue;
+    }
+    const onDemand = serverInfo.config?.startOnDemand === true && serverInfo.enabled !== false;
+    const idleOnDemand = onDemand && serverInfo.status !== 'connected';
+    if (serverInfo.status !== 'connected' && !idleOnDemand) continue;
+
+    let release: (() => void) | undefined;
+    try {
+      // Template freshness is independent of resources/list and only matters
+      // after exact-resource selection has failed.
+      await refreshModernServerLists(serverInfo, ['templates']);
+      const hasAllowedTemplate = async (forWake = false) => {
+        const client = serverInfo.client;
+        const wakeHints = () =>
+          serverInfo.resourceTemplates ?? templateDiscoveryStates.get(serverInfo)?.wakeHints;
+        const templates = forWake
+          ? wakeHints() ?? []
+          : await discoverResourceTemplates(serverInfo);
+        const matching = templates.filter(
+          (template) =>
+            typeof template.uriTemplate === 'string' &&
+            uriMatchesResourceTemplate(template.uriTemplate, uri),
+        );
+        advertised ||= matching.length > 0;
+        const match =
+          matching.length > 0 &&
+          (await isCurrentResourceReadAllowed(
+            serverInfo,
+            uri,
+            group,
+            matching.map((template) => template.uriTemplate),
+          ));
+        if (
+          match &&
+          (serverInfo.client !== client ||
+            (forWake ? wakeHints() : serverInfo.resourceTemplates) !== templates)
+        ) {
+          throw new Error('Resource templates changed during discovery; retry the request');
+        }
+        return match;
+      };
+      if (!(await hasAllowedTemplate(idleOnDemand))) continue;
+
+      if (onDemand) {
+        const failure = templateDiscoveryStates.get(serverInfo)?.failure;
+        if (idleOnDemand && failure && Date.now() - failure.at < TEMPLATE_DISCOVERY_RETRY_MS)
+          throw failure.error;
+        release = beginOnDemandToolCall(serverInfo);
+        if (!serverInfo.client) await ensureServerReady(serverInfo);
+        // Hints never authorize a read, even if another request completed wake
+        // while this request was checking policy.
+        if (idleOnDemand && !(await hasAllowedTemplate())) {
+          release?.();
+          continue;
+        }
+        serverInfo.lastUsedAt = Date.now();
+      }
+      return { serverInfo, release };
+    } catch (error) {
+      release?.();
+      lastDiscoveryError = error;
+    }
+  }
+  return { advertised, error: lastDiscoveryError };
+};
+
+const handleReadResourceRequestImpl = async (
+  request: any,
+  extra: any,
+  probedUiServers = new Set<ServerInfo>(),
+): Promise<any> => {
   try {
     const { uri } = request.params;
     const sessionId = extra.sessionId || '';
@@ -5401,10 +5640,15 @@ const handleReadResourceRequestImpl = async (request: any, extra: any) => {
       await getFilteredServerInfosForGroup(lookupGroup);
 
     let server: ServerInfo | undefined;
+    let advertised = false;
     for (const serverInfo of filteredServerInfos) {
-      if (serverInfo.status !== 'connected') {
-        continue;
-      }
+      const idleOnDemand =
+        serverInfo.config?.startOnDemand === true &&
+        serverInfo.enabled !== false &&
+        Array.isArray(serverInfo.resources) &&
+        serverInfo.resources.length > 0;
+      if (serverInfo.status !== 'connected' && !idleOnDemand) continue;
+      advertised ||= serverInfo.resources.some((resource) => resource.uri === uri);
       const serverConfig = await getServerDao().findById(serverInfo.name);
       let enabledResources = serverInfo.resources;
       if (serverConfig?.resources) {
@@ -5424,6 +5668,21 @@ const handleReadResourceRequestImpl = async (request: any, extra: any) => {
       }
     }
 
+    let releaseTemplateRead: (() => void) | undefined;
+    // An advertised exact resource reserves ownership even when policy denies
+    // its read. A broader template must not bypass that exact-resource policy.
+    if (!server && !advertised) {
+      const templateServer = await findResourceTemplateServer(
+        uri,
+        filteredServerInfos,
+        lookupGroup,
+      );
+      server = templateServer.serverInfo;
+      releaseTemplateRead = templateServer.release;
+      advertised ||= templateServer.advertised === true;
+      if (!server && templateServer.error !== undefined) throw templateServer.error;
+    }
+
     let result: any;
     // A cached SDK body carries its original TTL, not the remaining lifetime.
     // Fetch modern reads afresh so forwarding the TTL cannot renew stale content.
@@ -5431,13 +5690,19 @@ const handleReadResourceRequestImpl = async (request: any, extra: any) => {
       ? { cacheMode: 'bypass' as const }
       : undefined;
 
-    if (server?.client) {
+    if (server) {
       // A widget URI the upstream also lists in resources/list is read here, not in
       // the fallback loop below, so it needs the same idle guard: otherwise an
       // idle timer armed by an earlier read can close an on-demand upstream while
       // this read is still in flight.
-      const releaseOnDemandRead = beginOnDemandToolCall(server);
+      const releaseOnDemandRead = releaseTemplateRead ?? beginOnDemandToolCall(server);
       try {
+        if (!server.client && server.config?.startOnDemand) {
+          await ensureServerReady(server);
+          if (!(await isCurrentResourceReadAllowed(server, uri, lookupGroup)))
+            throw new Error(`Resource not found: ${uri}`);
+        }
+        if (!server.client) throw new Error(`Resource not found: ${uri}`);
         result = readOptions
           ? await server.client.readResource({ uri }, readOptions)
           : await server.client.readResource({ uri });
@@ -5447,7 +5712,9 @@ const handleReadResourceRequestImpl = async (request: any, extra: any) => {
       if (!result || !Array.isArray(result.contents)) {
         throw new Error(`Failed to read resource: ${uri}`);
       }
-    } else if (appsRouteContext.enabled && uri.startsWith('ui://')) {
+    } else if (!advertised && appsRouteContext.enabled && uri.startsWith('ui://')) {
+      // Only probe unadvertised URIs. An exact/template owner denied by policy
+      // must not fall through to an unrelated server that happens to answer.
       // Not pre-registered in resources/list — common for MCP Apps servers
       // that generate ui:// resources dynamically at tool-call time. A
       // single-server route goes straight to that server. A multi-server
@@ -5459,6 +5726,7 @@ const handleReadResourceRequestImpl = async (request: any, extra: any) => {
         : (appsRouteContext.serverInfos ?? []);
 
       for (const candidate of candidates) {
+        if (probedUiServers.has(candidate)) continue;
         const config = await getServerDao().findById(candidate.name);
         if (config?.resources?.[uri]?.enabled === false) continue;
         const allowed = await filterResourcesByGroup(
@@ -5479,12 +5747,18 @@ const handleReadResourceRequestImpl = async (request: any, extra: any) => {
             releaseOnDemandRead = beginOnDemandToolCall(candidate);
             if (!candidate.client) {
               await ensureServerReady(candidate);
+              if (!candidate.client) continue;
+              // Wake can advertise an exact or template owner, or fail discovery.
+              // Resolve again before legacy probing; keep this wake's idle guard
+              // until the resolved read completes and do not repeat prior probes.
+              return await handleReadResourceRequestImpl(request, extra, probedUiServers);
             }
             candidate.lastUsedAt = Date.now();
           }
           if (!candidate.client) {
             continue;
           }
+          probedUiServers.add(candidate);
           const candidateResult = readOptions
             ? await candidate.client.readResource({ uri }, readOptions)
             : await candidate.client.readResource({ uri });
@@ -5649,6 +5923,7 @@ const createPrincipalRuntime = async (
       );
       info.transport = transport;
       info.client = protectPersonalClient(client, info, resolvedConfig);
+      invalidateResourceTemplates(info);
       await info.client.connect(transport, resolvedConfig.options || {});
       const capabilities = client.getServerCapabilities();
       if (capabilities?.tools) {
@@ -5807,7 +6082,15 @@ const withModernLists =
                   jsonSchemaValidator: new ResilientJsonSchemaValidator(),
                 },
               );
-              discoveryInfo = { ...info, client, transport, tools: [], prompts: [], resources: [] };
+              discoveryInfo = {
+                ...info,
+                client,
+                transport,
+                tools: [],
+                prompts: [],
+                resources: [],
+                resourceTemplates: undefined,
+              };
               if (hasPersonalAuthentication(serverConfig)) {
                 discoveryInfo.client = protectPersonalClient(client, discoveryInfo, serverConfig);
               }
@@ -5817,17 +6100,20 @@ const withModernLists =
               await connectClientWithDiagnostics(client, transport, info.options || {});
             }
             await refreshModernServerLists(discoveryInfo, fields);
-          } catch {
-            // Exclude only this upstream for this request. Keep its shared state
-            // intact so later requests retry; disconnected projections force TTL zero.
-            scoped.set(info.name, {
+          } catch (error) {
+            // Exclude only this upstream for this request. Keep its runtime
+            // connected so later requests retry; disconnected projections force TTL zero.
+            const failed: ServerInfo = {
               ...info,
               status: 'disconnected',
               client: undefined,
               tools: [],
               prompts: [],
               resources: [],
-            });
+              resourceTemplates: undefined,
+            };
+            resourceDiscoveryErrors.set(failed, error);
+            scoped.set(info.name, failed);
             logger.warn('Failed to refresh upstream discovery for request', {
               serverName: info.name,
             });
