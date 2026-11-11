@@ -208,6 +208,7 @@ describe('mcpService reconnect config integration', () => {
           expect(serverInfo.keepAliveIntervalId).not.toBe(oldTimer);
           expect(setupClientKeepAlive).toHaveBeenCalledWith(serverInfo, config, {
             reconnectServer: expect.any(Function),
+            getServerInfo: expect.any(Function),
           });
           // A later outage must still be detected by the replacement timer.
           mockReconnectClient.listTools.mockRejectedValueOnce(new Error('upstream offline'));

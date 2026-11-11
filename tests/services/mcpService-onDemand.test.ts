@@ -3,6 +3,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { getSettingsPath } from '../../src/config/index.js';
 import { Client } from '@modelcontextprotocol/client';
+import { RequestContextService } from '../../src/services/requestContextService.js';
+import { MCP_APPS_CAPABILITIES } from '../../src/utils/mcpApps.js';
 /// <reference types="jest" />
 
 // Regression tests for issue #1029: startOnDemand servers could never be woken.
@@ -104,6 +106,7 @@ const mockFindAll = jest.fn(async () => []);
 const mockFindById = jest.fn();
 const mockExists = jest.fn().mockResolvedValue(true);
 const mockUpdate = jest.fn().mockResolvedValue(undefined);
+const mockGroupFindByName = jest.fn();
 jest.mock('../../src/dao/index.js', () => ({
   getServerDao: jest.fn(() => ({
     findAll: mockFindAll,
@@ -115,11 +118,7 @@ jest.mock('../../src/dao/index.js', () => ({
     get: jest.fn(async () => ({})),
   })),
   getGroupDao: jest.fn(() => ({
-    findByName: jest.fn(async (name: string) =>
-      name === 'solo'
-        ? { id: 'solo', name: 'solo', servers: [{ name: 'demo', alias: 'alias', tools: 'all' }] }
-        : undefined,
-    ),
+    findByName: mockGroupFindByName,
     findById: jest.fn(async () => undefined),
   })),
   getBuiltinPromptDao: jest.fn(() => ({
@@ -201,6 +200,11 @@ describe('startOnDemand lifecycle', () => {
     });
     mockFindById.mockResolvedValue(ON_DEMAND_CONFIG);
     mockFindAll.mockResolvedValue([]);
+    mockGroupFindByName.mockImplementation(async (name: string) =>
+      name === 'solo'
+        ? { id: 'solo', name: 'solo', servers: [{ name: 'demo', alias: 'alias', tools: 'all' }] }
+        : undefined,
+    );
     // Stub transport creation so the wake does not spawn a real child process.
     createTransportSpy = jest.spyOn(mcpService, 'createTransportFromConfig').mockResolvedValue({});
   });
@@ -234,6 +238,7 @@ describe('startOnDemand lifecycle', () => {
 
     beforeEach(() => {
       jest.useFakeTimers();
+      mockClient.getServerCapabilities.mockReturnValue({ tools: {}, resources: {} });
       mockFindById.mockResolvedValue({ ...ON_DEMAND_CONFIG, idleTimeoutMs: 1000 });
       mockClient.readResource.mockResolvedValue({ contents: [{ uri, text: 'owner' }] });
     });
@@ -294,6 +299,299 @@ describe('startOnDemand lifecycle', () => {
         expect(earlierRead).not.toHaveBeenCalled();
         await jest.advanceTimersByTimeAsync(1000);
         expect(info.client).toBeUndefined();
+      },
+    );
+
+    it('rediscovers templates after each actual idle shutdown and keeps resolving reads', async () => {
+      const { info } = await wake();
+      mockClient.listResourceTemplates.mockResolvedValue({ resourceTemplates: templates });
+      await list();
+
+      for (let cycle = 0; cycle < 2; cycle++) {
+        await jest.advanceTimersByTimeAsync(1000);
+        expect(info.status).toBe('disconnected');
+        expect(info.client).toBeUndefined();
+
+        expect((await read()).contents[0].text).toBe('owner');
+        expect(info.resourceTemplates).toEqual(templates);
+      }
+
+      expect(mockConnect).toHaveBeenCalledTimes(3);
+      expect(mockClient.listResourceTemplates).toHaveBeenCalledTimes(3);
+    });
+
+    it.each(['read', 'tool'])(
+      'recovers template discovery after failure and actual idle through a %s wake',
+      async (operation) => {
+        const { info } = await wake();
+        mockClient.listResourceTemplates.mockResolvedValue({ resourceTemplates: templates });
+        await list();
+        await jest.advanceTimersByTimeAsync(1000);
+        mockClient.listResourceTemplates.mockRejectedValueOnce(new Error('temporary failure'));
+        expect((await read()).contents[0].text).toContain('temporary failure');
+        expect(mockClient.readResource).not.toHaveBeenCalled();
+        expect(info.resourceTemplates).toBeUndefined();
+        await jest.advanceTimersByTimeAsync(1000);
+        expect(info.client).toBeUndefined();
+
+        // Idle must not clear the retry delay or authorize a read from old hints.
+        await jest.advanceTimersByTimeAsync(58_999);
+        expect((await read()).contents[0].text).not.toBe('owner');
+        expect(mockConnect).toHaveBeenCalledTimes(2);
+        expect(mockClient.listResourceTemplates).toHaveBeenCalledTimes(2);
+        expect(mockClient.readResource).not.toHaveBeenCalled();
+        await jest.advanceTimersByTimeAsync(1);
+
+        if (operation === 'tool') {
+          await mcpService.handleCallToolRequest(
+            { params: { name: 'demo::ping', arguments: {} } },
+            { sessionId: 'resource-session' },
+          );
+          expect(info.resourceTemplates).toEqual(templates);
+          await jest.advanceTimersByTimeAsync(1000);
+          expect(info.client).toBeUndefined();
+        }
+        expect((await read()).contents[0].text).toBe('owner');
+        expect(mockClient.readResource).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it('keeps discovery backoff across a tool wake before recovering', async () => {
+      const { info } = await wake();
+      mockClient.listResourceTemplates.mockResolvedValue({ resourceTemplates: templates });
+      await list();
+      await jest.advanceTimersByTimeAsync(1000);
+      mockClient.listResourceTemplates.mockRejectedValueOnce(new Error('temporary failure'));
+      expect((await read()).contents[0].text).toContain('temporary failure');
+      await jest.advanceTimersByTimeAsync(1000);
+      const tool = await mcpService.handleCallToolRequest(
+        { params: { name: 'demo::ping', arguments: {} } },
+        { sessionId: 'resource-session' },
+      );
+      expect(tool.content[0].text).toBe('pong');
+      expect((await read()).contents[0].text).toContain('temporary failure');
+      expect(mockClient.listResourceTemplates).toHaveBeenCalledTimes(2);
+      expect(mockClient.readResource).not.toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(59_000);
+      expect(info.client).toBeUndefined();
+      expect((await read()).contents[0].text).toBe('owner');
+    });
+
+    it.each(['empty', 'unsupported'])(
+      'clears old wake hints after recovery confirms templates are %s',
+      async (outcome) => {
+        const { info } = await wake();
+        mockClient.listResourceTemplates.mockResolvedValue({ resourceTemplates: templates });
+        await list();
+        await jest.advanceTimersByTimeAsync(1000);
+        mockClient.listResourceTemplates.mockRejectedValueOnce(new Error('temporary failure'));
+        await read();
+        await jest.advanceTimersByTimeAsync(60_000);
+        if (outcome === 'empty')
+          mockClient.listResourceTemplates.mockResolvedValue({ resourceTemplates: [] });
+        else mockClient.listResourceTemplates.mockRejectedValue({ code: -32601 });
+        expect((await read()).contents[0].text).toContain('Resource not found');
+        expect(info.resourceTemplates).toEqual([]);
+        await jest.advanceTimersByTimeAsync(1000);
+        expect(info.client).toBeUndefined();
+        expect((await read()).contents[0].text).toContain('Resource not found');
+        expect(mockConnect).toHaveBeenCalledTimes(3);
+        expect(mockClient.listResourceTemplates).toHaveBeenCalledTimes(3);
+        expect(mockClient.readResource).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(['concrete URI', 'template', 'server membership'])(
+      'rejects group %s revocation while template wake is pending',
+      async (revocation) => {
+        const { info } = await wake();
+        mockClient.listResourceTemplates.mockResolvedValue({ resourceTemplates: templates });
+        await list();
+        await jest.advanceTimersByTimeAsync(1000);
+        const groupConfig = {
+          id: 'solo',
+          name: 'solo',
+          servers: [{
+            name: 'demo',
+            alias: 'alias',
+            resources: [revocation === 'concrete URI' ? uri : templates[0].uriTemplate],
+          }],
+        };
+        mockGroupFindByName.mockResolvedValue(groupConfig);
+        const started = deferred<void>();
+        const connecting = deferred<void>();
+        mockConnect.mockImplementationOnce(() => {
+          started.resolve();
+          return connecting.promise;
+        });
+        const reading = mcpService.handleReadResourceRequest(
+          { method: 'resources/read', params: { uri } },
+          { group: 'solo', sessionId: 'resource-session' },
+        );
+        await started.promise;
+        mockGroupFindByName.mockResolvedValue({
+          ...groupConfig,
+          servers:
+            revocation === 'server membership'
+              ? []
+              : [{ ...groupConfig.servers[0], resources: [] }],
+        });
+        connecting.resolve();
+        expect((await reading).contents[0].text).toContain('Resource not found');
+        expect(mockClient.readResource).not.toHaveBeenCalled();
+        await jest.advanceTimersByTimeAsync(1000);
+        expect(info.client).toBeUndefined();
+      },
+    );
+
+    it.each([
+      ['exact', 'concrete URI'],
+      ['exact', 'server membership'],
+      ['dynamic UI', 'concrete URI'],
+      ['dynamic UI', 'server membership'],
+    ])('rejects group %s read after %s revocation during wake', async (kind, revocation) => {
+      const { info } = await wake();
+      const requestedUri = kind === 'exact' ? uri : 'ui://items/42';
+      if (kind === 'exact') info.resources = [{ uri: requestedUri, name: 'Exact' }];
+      await jest.advanceTimersByTimeAsync(1000);
+      const groupConfig = {
+        id: 'solo',
+        name: 'solo',
+        servers: [{ name: 'demo', alias: 'alias', resources: [requestedUri] }],
+      };
+      mockGroupFindByName.mockResolvedValue(groupConfig);
+      const started = deferred<void>();
+      const connecting = deferred<void>();
+      mockConnect.mockImplementationOnce(() => {
+        started.resolve();
+        return connecting.promise;
+      });
+      const reading = RequestContextService.getInstance().runWithCustomRequestContext(
+        { headers: {}, stateless: true, group: 'solo', clientCapabilities: MCP_APPS_CAPABILITIES },
+        () =>
+          mcpService.handleReadResourceRequest(
+            { method: 'resources/read', params: { uri: requestedUri } },
+            { group: 'solo' },
+          ),
+      );
+      await started.promise;
+      mockGroupFindByName.mockResolvedValue({
+        ...groupConfig,
+        servers:
+          revocation === 'server membership'
+            ? []
+            : [{ ...groupConfig.servers[0], resources: [] }],
+      });
+      connecting.resolve();
+      expect((await reading).contents[0].text).toContain('Resource not found');
+      expect(mockClient.readResource).not.toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(1000);
+      expect(info.client).toBeUndefined();
+    });
+
+    it.each(['disabled template', 'discovery failure', 'allowed template', 'unadvertised'])(
+      're-resolves dynamic UI ownership after wake: %s',
+      async (outcome) => {
+        const { info } = await wake();
+        await list();
+        expect(info.resourceTemplates).toEqual([]);
+        await jest.advanceTimersByTimeAsync(1000);
+        expect(info.client).toBeUndefined();
+        const requestedUri = 'ui://items/42';
+        const template = 'ui://items/{id}';
+        if (outcome === 'discovery failure') {
+          mockClient.listResourceTemplates.mockRejectedValue(new Error('UI discovery failed'));
+        } else {
+          mockClient.listResourceTemplates.mockResolvedValue({
+            resourceTemplates:
+              outcome === 'unadvertised' ? [] : [{ name: 'Widget', uriTemplate: template }],
+          });
+        }
+        if (outcome === 'disabled template') {
+          mockFindById.mockResolvedValue({
+            ...ON_DEMAND_CONFIG,
+            idleTimeoutMs: 1000,
+            resources: { [template]: { enabled: false } },
+          });
+        }
+        const result = await RequestContextService.getInstance().runWithCustomRequestContext(
+          { headers: {}, stateless: true, group: 'solo', clientCapabilities: MCP_APPS_CAPABILITIES },
+          () =>
+            mcpService.handleReadResourceRequest(
+              { method: 'resources/read', params: { uri: requestedUri } },
+              { group: 'solo' },
+            ),
+        );
+        if (outcome === 'disabled template' || outcome === 'discovery failure') {
+          expect(result.contents[0].text).toContain(
+            outcome === 'discovery failure' ? 'UI discovery failed' : 'Resource not found',
+          );
+          expect(mockClient.readResource).not.toHaveBeenCalled();
+        } else {
+          expect(result.contents[0].text).toBe('owner');
+          expect(mockClient.readResource).toHaveBeenCalledTimes(1);
+        }
+        await jest.advanceTimersByTimeAsync(1000);
+        expect(info.client).toBeUndefined();
+      },
+    );
+
+    it.each(['removed', 'failed', 'concrete denied', 'template denied'])(
+      'rechecks template ownership and policy after actual idle wake: %s',
+      async (outcome) => {
+        const { info } = await wake();
+        mockClient.listResourceTemplates.mockResolvedValue({ resourceTemplates: templates });
+        await list();
+        await jest.advanceTimersByTimeAsync(1000);
+        expect(info.client).toBeUndefined();
+
+        if (outcome === 'removed')
+          mockClient.listResourceTemplates.mockResolvedValue({ resourceTemplates: [] });
+        else if (outcome === 'failed')
+          mockClient.listResourceTemplates.mockRejectedValue(new Error('wake discovery failed'));
+        else
+          mockConnect.mockImplementationOnce(async () => {
+            mockFindById.mockResolvedValue({
+              ...ON_DEMAND_CONFIG,
+              idleTimeoutMs: 1000,
+              resources: {
+                [outcome === 'concrete denied' ? uri : templates[0].uriTemplate]: {
+                  enabled: false,
+                },
+              },
+            });
+          });
+
+        const result = await read();
+        expect(result.contents[0].text).toContain(
+          outcome === 'failed' ? 'wake discovery failed' : 'Resource not found',
+        );
+        expect(mockClient.readResource).not.toHaveBeenCalled();
+        expect(mockClient.listResourceTemplates).toHaveBeenCalledTimes(2);
+        await jest.advanceTimersByTimeAsync(1000);
+        expect(info.client).toBeUndefined();
+      },
+    );
+
+    it.each(['tool', 'exact resource'])(
+      'keeps %s calls available when optional template discovery fails during wake',
+      async (operation) => {
+        const { info } = await wake();
+        mockClient.listResourceTemplates.mockResolvedValue({ resourceTemplates: templates });
+        await list();
+        info.resources = [{ uri, name: 'Exact' }];
+        await jest.advanceTimersByTimeAsync(1000);
+        expect(info.client).toBeUndefined();
+        mockClient.listResourceTemplates.mockRejectedValue(new Error('optional discovery failed'));
+
+        if (operation === 'tool') {
+          const result = await mcpService.handleCallToolRequest(
+            { params: { name: 'demo::ping', arguments: {} } },
+            { sessionId: 'resource-session' },
+          );
+          expect(result.content[0].text).toBe('pong');
+        } else expect((await read()).contents[0].text).toBe('owner');
+        expect(mockClient.listResourceTemplates).toHaveBeenCalledTimes(2);
       },
     );
 
@@ -369,6 +667,19 @@ describe('startOnDemand lifecycle', () => {
       mockClient.listResourceTemplates.mockResolvedValue({ resourceTemplates: templates });
       changed(null, []);
       expect((await read()).contents[0].text).toBe('owner');
+    });
+
+    it('rejects a template snapshot invalidated during its policy check', async () => {
+      const { changed } = await wake();
+      mockClient.listResourceTemplates.mockResolvedValue({ resourceTemplates: templates });
+      await list();
+      mockFindById.mockImplementation(async () => {
+        changed(null, []);
+        return ON_DEMAND_CONFIG;
+      });
+
+      expect((await read()).contents[0].text).toContain('changed during discovery');
+      expect(mockClient.readResource).not.toHaveBeenCalled();
     });
   });
 
